@@ -120,7 +120,7 @@ class DebugInfo {
 }
 
 fun userAgent(): String {
-    return "vonage-number-verification-sdk" + "/" + BuildConfig.VERSION_NAME + "/" + Build.VERSION.SDK_INT + " " + "Android" + "/" + Build.VERSION.RELEASE + " " + Build.MANUFACTURER + "/" + Build.MODEL
+    return "vonage-client-library-android" + "/" + BuildConfig.VERSION_NAME + "/" + Build.VERSION.SDK_INT + " " + "Android" + "/" + Build.VERSION.RELEASE + " " + Build.MANUFACTURER + "/" + Build.MODEL
 }
 
 fun deviceInfo(): String {
