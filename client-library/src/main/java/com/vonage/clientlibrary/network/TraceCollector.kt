@@ -109,7 +109,7 @@ class DebugInfo {
     }
 
     override fun toString(): String {
-        var buffer = StringBuffer()
+        val buffer = StringBuffer()
         val sorted = bufferMap.toSortedMap()
         val skeys = sorted.keys
         for (key in skeys) {

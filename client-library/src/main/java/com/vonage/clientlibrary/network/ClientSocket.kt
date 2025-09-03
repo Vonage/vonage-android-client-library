@@ -2,10 +2,12 @@ package com.vonage.clientlibrary.network
 
 import android.os.Build
 import android.util.Log
+import org.json.JSONException
+import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStream
-import java.io.IOException
 import java.net.HttpCookie
 import java.net.Socket
 import java.net.URL
@@ -13,8 +15,6 @@ import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 import javax.net.ssl.SSLSocketFactory
-import org.json.JSONException
-import org.json.JSONObject
 
 internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollector.instance) {
     private lateinit var socket: Socket
@@ -60,12 +60,11 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
     }
 
     private fun convertResultHandler(res: ResultResponse): JSONObject {
-        var json: JSONObject = JSONObject()
+        val json: JSONObject = JSONObject()
         json.put("http_status", res.getHttpStatus())
         try {
-
-            if (res.getBody() != null)
-                json.put("response_body", JSONObject(res.getBody()))
+            val body = res.getBody()
+            if (body != null) { json.put("response_body", JSONObject(body)) }
             return json
         } catch (e: JSONException) {
             if (res.getBody() != null)
@@ -77,7 +76,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
     }
 
     private fun convertError(code: String, description: String): JSONObject {
-        var json: JSONObject = JSONObject()
+        val json: JSONObject = JSONObject()
         json.put("error", code)
         json.put("error_description", description)
         return json
@@ -95,10 +94,10 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         }
         cmd.append(CRLF)
         headers.forEach { entry ->
-            cmd.append(entry.key + ": " + entry.value + "$CRLF")
+            cmd.append(entry.key + ": " + entry.value + CRLF)
         }
         if (body != null) {
-            cmd.append("Content-Length: " + body.length + "$CRLF")
+            cmd.append("Content-Length: " + body.length + CRLF)
             cmd.append("Connection: close$CRLF$CRLF")
             cmd.append(body)
             cmd.append("$CRLF$CRLF")
@@ -126,7 +125,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         var result: ResponseHandler? = null
         var chunked: Boolean = false
         try {
-            var response: String? = readMultipleChars(input, 65536)
+            val response: String? = readMultipleChars(input, 65536)
             tracer.addDebug(Log.DEBUG, TAG, "$response \n")
             tracer.addDebug(Log.DEBUG, TAG, "--------" + "\n")
             response?.let {
@@ -141,7 +140,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                             tracer.addDebug(Log.DEBUG, TAG, "Status - $status")
                         }
                     } else if (line.startsWith("Transfer-Encoding:")) {
-                        var parts = line.split(" ")
+                        val parts = line.split(" ")
                         if (!parts.isEmpty() && parts.size > 1) {
                             if (parts[1].contains("chunked")) chunked = true
                         }
@@ -152,7 +151,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                         tracer.addDebug(Log.DEBUG, TAG, "Adding to body - $body\n")
                     }
                 }
-                if (chunked && !body.isNullOrBlank()) {
+                if (chunked && body.isNotBlank()) {
                     val r1: Int = body.indexOf("{")
                     val r2: Int = body.lastIndexOf("}")
                     if (r1 in 1 until r2) {
@@ -205,7 +204,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         }
         cmd.append(CRLF)
         headers?.forEach { entry ->
-            cmd.append(entry.key + ": " + entry.value + "${Companion.CRLF}")
+            cmd.append(entry.key + ": " + entry.value + Companion.CRLF)
         }
         val userAgent = userAgent()
         cmd.append("$HEADER_USER_AGENT: $userAgent$CRLF")
@@ -219,7 +218,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
             cmd.append("x-silentauth-mode: sandbox$CRLF")
         }
         cmd.append("Accept: text/html,application/xhtml+xml,application/xml,*/*$CRLF")
-        var cs = StringBuffer()
+        val cs = StringBuffer()
         var cookieCount = 0
         val iterator = cookies.orEmpty().listIterator()
         for (cookie in iterator) {
@@ -232,7 +231,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                 cookieCount++
             }
         }
-        if (cs.length > 1) cmd.append("Cookie: " + cs.toString() + "$CRLF")
+        if (cs.length > 1) cmd.append("Cookie: $cs$CRLF")
 
         cmd.append("Connection: close$CRLF$CRLF")
         return cmd.toString()
@@ -314,12 +313,12 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         var type: String = ""
         var result: ResultHandler? = null
         var bodyBegin: Boolean = false
-        var cookies: ArrayList<HttpCookie> = ArrayList<HttpCookie>()
+        val cookies: ArrayList<HttpCookie> = ArrayList<HttpCookie>()
         if (existingCookies != null) cookies.addAll(existingCookies)
 
         try {
             // convert the entire stream in a String
-            var response: String? = input.use { it.readText() }
+            val response: String? = input.use { it.readText() }
             response?.let {
                 val lines = response.split("\n")
                 for (line in lines) {
@@ -383,8 +382,8 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
     fun parseBodyIntoJSONString(body: String?): String? {
         if (body != null) {
             val start = body.indexOf("{")
-            var end = body.lastIndexOf("}")
-            var json = body.subSequence(start, end + 1).toString()
+            val end = body.lastIndexOf("}")
+            val json = body.subSequence(start, end + 1).toString()
             return json
         }
         return null
@@ -397,12 +396,12 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         cookies: ArrayList<HttpCookie>?
     ): ResultHandler? {
         tracer.addDebug(Log.DEBUG, TAG, "parseRedirect : $redirectLine")
-        var parts = redirectLine.split("ocation: ")
+        val parts = redirectLine.split("ocation: ")
         if (parts.isNotEmpty() && parts.size > 1) {
             if (parts[1].isBlank()) return null
             val redirect = parts[1]
             // some location header are not properly encoded
-            var cleanRedirect = redirect.replace(" ", "+")
+            val cleanRedirect = redirect.replace(" ", "+")
             tracer.addDebug(Log.DEBUG, TAG, "cleanRedirect : $cleanRedirect")
             if (!cleanRedirect.startsWith("http")) { // http & https
                 return ResultHandler(httpStatus, URL(requestURL, cleanRedirect), null, cookies)
