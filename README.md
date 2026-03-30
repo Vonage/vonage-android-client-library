@@ -3,6 +3,7 @@
 A library to support using the Vonage APIs on Android. Features:
 
 * Force a cellular network request for use with [Vonage Number Verification](https://developer.vonage.com/en/number-verification/overview) and [Vonage Verify Silent Authentication](https://developer.vonage.com/en/verify/guides/silent-authentication)
+* Retrieve TS.43 tokens for [Phone Number Verification](https://developer.android.com/identity/digital-credentials/phone-number-verification) using the Google Digital Credentials API.
 
 ## Installation
 
@@ -22,7 +23,7 @@ import com.vonage.clientlibrary.VGCellularRequestParameters
 
 VGCellularRequestClient.initializeSdk(this.applicationContext)
 
-val params = VGCellularRequestClientParameters(
+val params = VGCellularRequestParameters(
     url = "http://www.vonage.com",
     headers = mapOf("x-my-header" to "My Value") ,
     queryParameters = mapOf("query-param" to "value"),
@@ -30,11 +31,11 @@ val params = VGCellularRequestClientParameters(
 )
 
 val response = VGCellularRequestClient.getInstance().startCellularGetRequest(params, false)
-if (response.optString("error") != "") {
+if (response.has("error")) {
     // error
 } else {
     val status = response.optInt("http_status")
-    val jsonReponse = response.getJSONObject("response_body") // Body of response parsed to JSON (NULL if not JSON)
+    val jsonReponse = response.optJSONObject("response_body") // Body of response parsed to JSON (NULL if not JSON)
     val rawReponse = response.optString("response_raw_body") // RAW string of response body (Only populated if not JSON)
     if (status == 200) {
         // 200 OK
@@ -44,33 +45,50 @@ if (response.optString("error") != "") {
 }
 ```
 * `maxRedirectCount` in `VGCellularRequestParameters` is an optional and defaults to 10.
-* `debug` parameter for `startCellularRequest` is optional and defaults to false.
+* `debug` parameter for `startCellularGetRequest` is optional and defaults to false.
+
+### Retrieve TS.43 Token
+
+You can use the SDK to retrieve a TS.43 token, which can then be exchanged with an aggregator for phone number verification.
+
+```kotlin
+import com.vonage.clientlibrary.VGCellularRequestClient
+
+VGCellularRequestClient.getInstance().getTS43Token(this) { token, exception ->
+    if (exception != null) {
+        // Handle error
+    } else if (token != null) {
+        // Use token to exchange with aggregator
+    }
+}
+```
 
 #### Responses
 
 * Success - When the data connectivity has been achieved, and a response has been received from the url endpoint:
-```
+```json
 {
-    "http_status": string, // HTTP status related to the url
-    "response_body" : { // Optional depending on the HTTP status
-        ... // The response body of the opened url
+    "http_status": 200,
+    "response_body" : {
+        "status": "success",
+        "message": "Verification successful"
     },
     "debug" : {
-        "device_info": string, 
-        "url_trace" : string
+        "device_info": "Android 14", 
+        "url_trace" : "..."
     }
 }
 ```
 
 * Error - When data connectivity is not available and/or an internal SDK error occurred:
 
-```
+```json
 {
-    "error" : string,
-    "error_description": string,
+    "error" : "sdk_no_data_connectivity",
+    "error_description": "The device is not connected to a cellular network.",
     "debug" : {
-        "device_info": string, 
-        "url_trace" : string
+        "device_info": "Android 14", 
+        "url_trace" : "..."
     }
 }
 ```
@@ -129,7 +147,7 @@ VGCellularRequestClient.initializeSdk(this.applicationContext)
 
 ### Make the new Network Call:
 
-`com.vonage:client-library` uses a params object to pass information to the function that makes the network call. This is a similar approach to `om.vonage:client-sdk-number-verification`, but new if you are using `com.vonage:client-sdk-silent-auth`.
+`com.vonage:client-library` uses a params object to pass information to the function that makes the network call. This is a similar approach to `com.vonage:client-sdk-number-verification`, but new if you are using `com.vonage:client-sdk-silent-auth`.
 
 ```kotlin
 // com.vonage:client-sdk-silent-auth

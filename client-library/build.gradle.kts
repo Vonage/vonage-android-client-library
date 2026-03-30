@@ -5,6 +5,7 @@ plugins {
     alias(libs.plugins.jetbrains.kotlin.android)
     id("maven-publish")
     id("signing")
+    id("com.gradleup.nmcp") version "0.0.8"
 }
 
 val localProperties = Properties()
@@ -17,7 +18,7 @@ android {
     defaultConfig {
         minSdk = 24
         lint.targetSdk = 35
-        version = "1.0.1"
+        version = "1.1.0-alpha01"
 
         android.buildFeatures.buildConfig = true
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -25,11 +26,11 @@ android {
 
     buildTypes {
         debug {
-            buildConfigField("String","VERSION_NAME","\"1.0.1\"")
+            buildConfigField("String","VERSION_NAME","\"1.1.0-alpha01\"")
         }
         release {
-            buildConfigField("String","VERSION_NAME","\"1.0.1\"")
-            isMinifyEnabled=  false
+            buildConfigField("String","VERSION_NAME","\"1.1.0-alpha01\"")
+            isMinifyEnabled = false
         }
     }
     compileOptions {
@@ -46,8 +47,9 @@ publishing {
         create<MavenPublication>("aar") {
             groupId = "com.vonage"
             artifactId = "client-library"
-            version = "1.0.1"
-            artifact("$buildDir/outputs/aar/${project.name}-release.aar")
+            version = "1.1.0-alpha01"
+            val buildDirPath = project.layout.buildDirectory.get().asFile.path
+            artifact("$buildDirPath/outputs/aar/${project.name}-release.aar")
             pom {
                 name = "Vonage Client Library"
                 description =
@@ -86,29 +88,39 @@ publishing {
             }
         }
     }
+}
 
-    repositories {
-        maven {
-            name = "OSSRH"
-            url = uri("https://oss.sonatype.org/service/local/staging/deploy/maven2/")
-            credentials {
-                username = localProperties["nexusUsername"].toString()
-                password = localProperties["nexusPassword"].toString()
-            }
-        }
+nmcp {
+    publishAllPublications {
+        username = localProperties["centralUsername"].toString()
+        password = localProperties["centralPassword"].toString()
+        
+        publicationType = "AUTOMATIC"
     }
 }
 
 signing {
-    sign(publishing.publications["aar"])
+    val keyId = localProperties["signing.keyId"]?.toString()
+    val password = localProperties["signing.password"]?.toString()
+    val secretKeyRingFile = localProperties["signing.secretKeyRingFile"]?.toString()
+    
+    if (keyId != null && password != null && secretKeyRingFile != null) {
+        // Set the signing properties for this project
+        project.ext["signing.keyId"] = keyId
+        project.ext["signing.password"] = password
+        project.ext["signing.secretKeyRingFile"] = project.rootProject.file(secretKeyRingFile).absolutePath
+        
+        sign(publishing.publications["aar"])
+    }
 }
 
 dependencies {
-    implementation (libs.androidx.appcompat)
-    implementation (libs.kotlin.stdlib)
-    implementation (libs.androidx.core.ktx)
-    implementation (libs.okhttp)
-    implementation (libs.logging.interceptor)
+    implementation(libs.androidx.appcompat)
+    implementation(libs.kotlin.stdlib)
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.okhttp)
+    implementation(libs.logging.interceptor)
+    implementation(libs.androidx.credentials)
 }
 java {
     toolchain {
