@@ -17,7 +17,10 @@ import javax.net.ssl.SSLSocketFactory
 import org.json.JSONException
 import org.json.JSONObject
 
-internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollector.instance) {
+internal class ClientSocket constructor(
+    var tracer: TraceCollector = TraceCollector.instance,
+    private val isDebuggable: Boolean = false
+) {
     private lateinit var socket: Socket
     private lateinit var output: OutputStream
     private lateinit var input: BufferedReader
@@ -109,7 +112,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
     }
 
     private fun sendAndReceive(request: String): ResponseHandler? {
-        tracer.addDebug(Log.DEBUG, TAG, "Client sending \n$request\n")
+        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Client sending \n$request\n")
         try {
             val bytesOfRequest: ByteArray =
                 request.toByteArray(Charset.forName(StandardCharsets.UTF_8.name()))
@@ -126,13 +129,17 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         var chunked: Boolean = false
         try {
             var response: String? = readMultipleChars(input, 65536)
-            tracer.addDebug(Log.DEBUG, TAG, "$response \n")
-            tracer.addDebug(Log.DEBUG, TAG, "--------" + "\n")
+            if (isDebuggable) {
+                tracer.addDebug(Log.DEBUG, TAG, "$response \n")
+                tracer.addDebug(Log.DEBUG, TAG, "--------\n")
+            }
             response?.let {
                 val lines = response.split("\n")
                 for (line in lines) {
-                    tracer.addDebug(Log.DEBUG, TAG, line)
-                    tracer.addTrace(line)
+                    if (isDebuggable) {
+                        tracer.addDebug(Log.DEBUG, TAG, line)
+                        tracer.addTrace(line)
+                    }
                     if (line.startsWith("HTTP/")) {
                         val parts = line.split(" ")
                         if (parts.isNotEmpty() && parts.size >= 2) {
@@ -148,7 +155,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                         // do nothing
                     } else {
                         body += line.replace("\r", "")
-                        tracer.addDebug(Log.DEBUG, TAG, "Adding to body - $body\n")
+                        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Adding to body - $body\n")
                     }
                 }
                 if (chunked && !body.isNullOrBlank()) {
@@ -158,7 +165,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                         body = body.substring(r1, r2 + 1)
                     }
                 }
-                tracer.addDebug(Log.DEBUG, TAG, "Status - $status [$chunked]\nBody - $body\n")
+                if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Status - $status [$chunked]\nBody - $body\n")
                 result = ResponseHandler(status, body)
             }
         } catch (ex: Exception) {
@@ -310,8 +317,10 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         message: String,
         existingCookies: ArrayList<HttpCookie>?
     ): ResultHandler? {
-        tracer.addDebug(Log.DEBUG, TAG, "Client sending \n$message\n")
-        tracer.addTrace(message)
+        if (isDebuggable) {
+            tracer.addDebug(Log.DEBUG, TAG, "Client sending \n$message\n")
+            tracer.addTrace(message)
+        }
         try {
             val bytesOfRequest: ByteArray =
                 message.toByteArray(Charset.forName(StandardCharsets.UTF_8.name()))
@@ -338,8 +347,10 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
             response?.let {
                 val lines = response.split("\n")
                 for (line in lines) {
-                    tracer.addDebug(Log.DEBUG, TAG, line)
-                    tracer.addTrace(line)
+                    if (isDebuggable) {
+                        tracer.addDebug(Log.DEBUG, TAG, line)
+                        tracer.addTrace(line)
+                    }
                     if (line.startsWith("HTTP/")) {
                         val parts = line.split(" ")
                         if (parts.isNotEmpty() && parts.size >= 2) {
@@ -353,11 +364,13 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                             try {
                                 for (cookie in HttpCookie.parse(parts[1])) {
                                     cookies.add(cookie)
-                                    tracer.addDebug(Log.DEBUG, TAG, "cookie - $cookie")
-                                    tracer.addTrace("cookie - $cookie\n")
+                                    if (isDebuggable) {
+                                        tracer.addDebug(Log.DEBUG, TAG, "cookie - $cookie")
+                                        tracer.addTrace("cookie - $cookie\n")
+                                    }
                                 }
                             } catch (ex: IllegalArgumentException) {
-                                tracer.addTrace("Cannot parse cookie ${parts[1]}  ${ex.message}\n")
+                                tracer.addTrace("Cannot parse cookie ${ex.message}\n")
                             }
                         }
                     } else if (line.contains("Location:") || line.contains("location:")) {
@@ -375,11 +388,11 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                             "\r",
                             ""
                         )
-                        tracer.addDebug(Log.DEBUG, TAG, "Adding to body - $body\n")
+                        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Adding to body - $body\n")
                     }
                 }
-                tracer.addDebug(Log.DEBUG, TAG, "Status - $status\nBody - $body\n")
-                tracer.addTrace("Status - $status ${DateUtils.now()}\nBody - $body\n")
+                if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Status - $status\nBody - $body\n")
+                tracer.addTrace("Status - $status ${DateUtils.now()}\n")
                 result = if (result != null)
                     return result
                 else if (bodyBegin && body != null) {
