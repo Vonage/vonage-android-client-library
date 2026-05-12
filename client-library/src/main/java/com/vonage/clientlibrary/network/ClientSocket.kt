@@ -135,8 +135,10 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
             response?.let {
                 val lines = response.split("\n")
                 for (line in lines) {
-                    if (BuildConfig.DEBUG) tracer.addDebug(Log.DEBUG, TAG, line)
-                    tracer.addTrace(line)
+                    if (BuildConfig.DEBUG) {
+                        tracer.addDebug(Log.DEBUG, TAG, line)
+                        tracer.addTrace(line)
+                    }
                     if (line.startsWith("HTTP/")) {
                         val parts = line.split(" ")
                         if (parts.isNotEmpty() && parts.size >= 2) {
@@ -300,8 +302,8 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
     ): ResultHandler? {
         if (BuildConfig.DEBUG) {
             tracer.addDebug(Log.DEBUG, TAG, "Client sending \n$message\n")
+            tracer.addTrace(message)
         }
-        tracer.addTrace(message)
         try {
             val bytesOfRequest: ByteArray =
                 message.toByteArray(Charset.forName(StandardCharsets.UTF_8.name()))
@@ -328,8 +330,10 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
             response?.let {
                 val lines = response.split("\n")
                 for (line in lines) {
-                    if (BuildConfig.DEBUG) tracer.addDebug(Log.DEBUG, TAG, line)
-                    tracer.addTrace(line)
+                    if (BuildConfig.DEBUG) {
+                        tracer.addDebug(Log.DEBUG, TAG, line)
+                        tracer.addTrace(line)
+                    }
                     if (line.startsWith("HTTP/")) {
                         val parts = line.split(" ")
                         if (parts.isNotEmpty() && parts.size >= 2) {
@@ -343,11 +347,13 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                             try {
                                 for (cookie in HttpCookie.parse(parts[1])) {
                                     cookies.add(cookie)
-                                    if (BuildConfig.DEBUG) tracer.addDebug(Log.DEBUG, TAG, "cookie - $cookie")
-                                    tracer.addTrace("cookie - $cookie\n")
+                                    if (BuildConfig.DEBUG) {
+                                        tracer.addDebug(Log.DEBUG, TAG, "cookie - $cookie")
+                                        tracer.addTrace("cookie - $cookie\n")
+                                    }
                                 }
                             } catch (ex: IllegalArgumentException) {
-                                tracer.addTrace("Cannot parse cookie ${parts[1]}  ${ex.message}\n")
+                                tracer.addTrace("Cannot parse cookie ${ex.message}\n")
                             }
                         }
                     } else if (line.contains("Location:") || line.contains("location:")) {
@@ -369,7 +375,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                     }
                 }
                 if (BuildConfig.DEBUG) tracer.addDebug(Log.DEBUG, TAG, "Status - $status\nBody - $body\n")
-                tracer.addTrace("Status - $status ${DateUtils.now()}\nBody - $body\n")
+                tracer.addTrace("Status - $status ${DateUtils.now()}\n")
                 result = if (result != null)
                     return result
                 else if (bodyBegin && body != null) {
