@@ -110,6 +110,15 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
     }
 
     private fun execute(onCompletion: (isSuccess: Boolean) -> Unit) {
+        // DEVX-11224: Fast-path — if cellular is already available and bound to the
+        // process, skip the expensive requestNetwork() flow (which can wait up to 5s
+        // for network acquisition even when cellular is already active).
+        if (isCellularAvailable() && isCellularBoundToProcess()) {
+            tracer.addDebug(Log.DEBUG, TAG, "Fast-path: cellular already available and bound")
+            onCompletion(true)
+            return
+        }
+
         try {
             val lock = ReentrantLock()
             val condition = lock.newCondition()
