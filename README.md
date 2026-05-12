@@ -79,9 +79,9 @@ Potential error codes: `sdk_no_data_connectivity`, `sdk_connection_error`, `sdk_
 
 ## Logging
 
-The SDK logs detailed request and response data (URLs, headers, body content) to help with debugging. This output is gated behind `BuildConfig.DEBUG` and is **only emitted in debug builds** — it is automatically suppressed in release builds.
+The SDK logs detailed request and response data (URLs, headers, body content) to help with debugging. This output is gated behind the host app's debuggable flag (`ApplicationInfo.FLAG_DEBUGGABLE`) and is **only emitted when your app is built as debuggable** — it is automatically suppressed in release builds.
 
-If you need to inspect SDK network activity during development, build and run your app in debug mode and filter logcat by the `ClientSocket` tag.
+If you need to inspect SDK network activity during development, build and run your app in debug mode and filter logcat by the `CellularClient` tag.
 
 ## Migrating from `com.vonage:client-sdk-silent-auth` or `com.vonage:client-sdk-number-verification`
 
