@@ -28,24 +28,43 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         maxRedirectCount: Int
     ): JSONObject {
         val requestId: String = UUID.randomUUID().toString()
+        val deadline = System.currentTimeMillis() + GLOBAL_DEADLINE_MS
         var redirectURL: URL? = null
         var redirectCount = 0
         var result: ResultHandler? = null
+        var connectedHost: String? = null
         do {
             redirectCount += 1
             val nurl = redirectURL ?: url
             tracer.addDebug(Log.DEBUG, TAG, "Requesting: $nurl")
+
+            val remainingMs = deadline - System.currentTimeMillis()
+            if (remainingMs <= 0)
+                return convertError("sdk_timeout_error", "Operation deadline exceeded")
+
             try {
-                startConnection(nurl)
-                if (redirectCount == 1)
-                    result = sendCommand(nurl, headers, operator, null, requestId)
+                // Reuse the existing TCP+TLS connection for same-host redirects (DEVX-11219).
+                // Open a new connection when the host changes or on the first request.
+                if (nurl.host != connectedHost) {
+                    if (connectedHost != null) stopConnection()
+                    startConnection(nurl, remainingMs)
+                    connectedHost = nurl.host
+                }
+
+                result = if (redirectCount == 1)
+                    sendCommand(nurl, headers, operator, null, requestId, keepAlive = true)
                 else
-                    result = sendCommand(nurl, null, null, result?.getCookies(), requestId)
-                if (result?.getRedirect() != null)
-                    redirectURL = result.getRedirect()
-                else
-                    redirectURL = null
-                stopConnection()
+                    sendCommand(nurl, null, null, result?.getCookies(), requestId, keepAlive = true)
+
+                redirectURL = result?.getRedirect()
+
+                // Close the connection when there are no more redirects, or when the
+                // next redirect goes to a different host (Connection: close was not sent
+                // for same-host hops, so the server is keeping the socket open).
+                if (redirectURL == null || redirectURL!!.host != nurl.host) {
+                    stopConnection()
+                    connectedHost = null
+                }
             } catch (ex: Exception) {
                 tracer.addDebug(Log.DEBUG, TAG, "Cannot start connection: $nurl")
                 return convertError("sdk_connection_error", "ex: ".plus(ex.localizedMessage))
@@ -185,7 +204,8 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         headers: Map<String, String>?,
         operator: String?,
         cookies: ArrayList<HttpCookie>?,
-        requestId: String?
+        requestId: String?,
+        keepAlive: Boolean = false
     ): String {
         val CRLF = "\r\n"
         val cmd = StringBuffer()
@@ -234,7 +254,10 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         }
         if (cs.length > 1) cmd.append("Cookie: " + cs.toString() + "$CRLF")
 
-        cmd.append("Connection: close$CRLF$CRLF")
+        // For same-host keep-alive chains, omit Connection: close so the server
+        // keeps the TCP+TLS socket open for the next hop (DEVX-11219).
+        if (!keepAlive) cmd.append("Connection: close$CRLF")
+        cmd.append(CRLF)
         return cmd.toString()
     }
 
@@ -243,13 +266,14 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         headers: Map<String, String>?,
         operator: String?,
         cookies: ArrayList<HttpCookie>?,
-        requestId: String?
+        requestId: String?,
+        keepAlive: Boolean = false
     ): ResultHandler? {
-        val command = makeHTTPCommand(url, headers, operator, cookies, requestId)
+        val command = makeHTTPCommand(url, headers, operator, cookies, requestId, keepAlive)
         return sendAndReceive(url, command, cookies)
     }
 
-    private fun startConnection(url: URL) {
+    private fun startConnection(url: URL, timeoutMs: Long = 5_000) {
         var port = PORT_80
         if (url.port > 0) port = url.port
         tracer.addDebug(Log.DEBUG, TAG, "start : ${url.host} ${url.port} ${url.protocol}")
@@ -273,7 +297,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                 TAG,
                 "Client created : ${socket.inetAddress.hostAddress} ${socket.port}"
             )
-            socket.soTimeout = 5 * 1000
+            socket.soTimeout = timeoutMs.coerceIn(1_000, GLOBAL_DEADLINE_MS).toInt()
             output = socket.getOutputStream()
             input = BufferedReader(InputStreamReader(socket.inputStream))
             tracer.addDebug(
@@ -307,77 +331,83 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
             tracer.addTrace("Client sending exception ${ex.message}\n")
             throw ex
         }
-        tracer.addDebug(Log.DEBUG, TAG, "Response " + "\n")
+        tracer.addDebug(Log.DEBUG, TAG, "Response\n")
         tracer.addTrace("Response - ${DateUtils.now()} \n")
         var status: Int = 0
-        var body: String? = null
         var type: String = ""
-        var result: ResultHandler? = null
+        var redirectResult: ResultHandler? = null
         var bodyBegin: Boolean = false
-        var cookies: ArrayList<HttpCookie> = ArrayList<HttpCookie>()
+        val bodyBuilder = StringBuilder()  // DEVX-11223: avoid O(n²) string concat
+        val cookies: ArrayList<HttpCookie> = ArrayList()
         if (existingCookies != null) cookies.addAll(existingCookies)
 
         try {
-            // convert the entire stream in a String
-            var response: String? = input.use { it.readText() }
-            response?.let {
-                val lines = response.split("\n")
-                for (line in lines) {
-                    tracer.addDebug(Log.DEBUG, TAG, line)
-                    tracer.addTrace(line)
-                    if (line.startsWith("HTTP/")) {
+            // DEVX-11221: Parse headers line-by-line instead of buffering the full response.
+            // On a 3xx redirect, return as soon as the Location header is seen — no body read.
+            var line: String? = input.readLine()
+            while (line != null) {
+                tracer.addTrace(line + "\n")
+                when {
+                    line.startsWith("HTTP/") -> {
                         val parts = line.split(" ")
-                        if (parts.isNotEmpty() && parts.size >= 2) {
-                            status = Integer.valueOf(parts[1].trim())
+                        if (parts.size >= 2) {
+                            status = parts[1].trim().toIntOrNull() ?: 0
                             tracer.addDebug(Log.DEBUG, TAG, "Status - $status")
                             tracer.addTrace("Status - $status ${DateUtils.now()}\n")
                         }
-                    } else if (line.contains("Set-Cookie:") || line.contains("set-cookie:")) {
+                    }
+                    line.startsWith("Set-Cookie:", ignoreCase = true) -> {
                         val parts: List<String> = line.split("ookie:")
-                        if (parts.isNotEmpty() && parts.size > 1) {
+                        if (parts.size > 1) {
                             try {
                                 for (cookie in HttpCookie.parse(parts[1])) {
                                     cookies.add(cookie)
-                                    tracer.addDebug(Log.DEBUG, TAG, "cookie - $cookie")
+                                    if (BuildConfig.DEBUG) tracer.addDebug(Log.DEBUG, TAG, "cookie - $cookie")
                                     tracer.addTrace("cookie - $cookie\n")
                                 }
                             } catch (ex: IllegalArgumentException) {
                                 tracer.addTrace("Cannot parse cookie ${parts[1]}  ${ex.message}\n")
                             }
                         }
-                    } else if (line.contains("Location:") || line.contains("location:")) {
-                        result = parseRedirect(status, requestURL, line.replace("\r", ""), cookies)
-                    } else if (line.contains("Content-Type:") || line.contains("content-type:")) {
+                    }
+                    line.startsWith("Location:", ignoreCase = true) -> {
+                        redirectResult = parseRedirect(status, requestURL, line.trimEnd('\r'), cookies)
+                        // DEVX-11221: Early return on redirect — skip downloading the body.
+                        if (redirectResult != null && status in 300..399) {
+                            tracer.addTrace("Redirect detected, skipping body - ${DateUtils.now()}\n")
+                            return redirectResult
+                        }
+                    }
+                    line.startsWith("Content-Type:", ignoreCase = true) -> {
                         val parts = line.split(" ")
-                        if (parts.isNotEmpty() && parts.size > 1) {
-                            type = parts[1].replace(";", "").replace("\r", "")
+                        if (parts.size > 1) {
+                            type = parts[1].replace(";", "").trimEnd('\r')
                         }
                         tracer.addDebug(Log.DEBUG, TAG, "Type - $type\n")
-                    } else if (("application/json" == type || "application/hal+json" == type || "application/problem+json" == type) && line == "\r") {
+                    }
+                    (type == "application/json" || type == "application/hal+json" || type == "application/problem+json") && line.trimEnd('\r').isEmpty() -> {
                         bodyBegin = true
-                    } else if (bodyBegin) {
-                        body = if (body != null) body + line.replace("\r", "") else line.replace(
-                            "\r",
-                            ""
-                        )
-                        tracer.addDebug(Log.DEBUG, TAG, "Adding to body - $body\n")
+                    }
+                    bodyBegin -> {
+                        bodyBuilder.append(line.trimEnd('\r'))  // DEVX-11223: StringBuilder
+                        if (BuildConfig.DEBUG) tracer.addDebug(Log.DEBUG, TAG, "Adding to body\n")
                     }
                 }
-                tracer.addDebug(Log.DEBUG, TAG, "Status - $status\nBody - $body\n")
-                tracer.addTrace("Status - $status ${DateUtils.now()}\nBody - $body\n")
-                result = if (result != null)
-                    return result
-                else if (bodyBegin && body != null) {
-                    ResultHandler(status, null, parseBodyIntoJSONString(body), cookies)
-                } else
-                    ResultHandler(status, null, null, null)
+                line = input.readLine()
+            }
+            val body: String? = if (bodyBegin && bodyBuilder.isNotEmpty()) bodyBuilder.toString() else null
+            if (BuildConfig.DEBUG) tracer.addDebug(Log.DEBUG, TAG, "Status - $status\nBody - $body\n")
+            tracer.addTrace("Status - $status ${DateUtils.now()}\nBody - $body\n")
+            return redirectResult ?: if (bodyBegin && body != null) {
+                ResultHandler(status, null, parseBodyIntoJSONString(body), cookies)
+            } else {
+                ResultHandler(status, null, null, null)
             }
         } catch (ex: Exception) {
             tracer.addDebug(Log.ERROR, TAG, "Client reading exception : ${ex.message}")
             tracer.addTrace("Client reading exception ${ex.message}\n")
             throw ex
         }
-        return result
     }
 
     fun parseBodyIntoJSONString(body: String?): String? {
@@ -442,14 +472,15 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
 
     @Throws(IOException::class)
     private fun readMultipleChars(reader: BufferedReader, length: Int): String? {
-        val chars = CharArray(length)
-        val charsRead = reader.read(chars, 0, length)
-        val result: String = if (charsRead != -1) {
-            String(chars, 0, charsRead)
-        } else {
-            ""
+        // DEVX-11222: Loop until EOF — a single read() can return a partial buffer on
+        // slow cellular networks where data trickles in across multiple TCP segments.
+        val sb = StringBuilder()
+        val buf = CharArray(length)
+        var charsRead: Int
+        while (reader.read(buf, 0, length).also { charsRead = it } != -1) {
+            sb.append(buf, 0, charsRead)
         }
-        return result
+        return sb.toString()
     }
 
     companion object {
@@ -458,6 +489,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         private const val PORT_80 = 80
         private const val PORT_443 = 443
         private const val CRLF = "\r\n"
+        private const val GLOBAL_DEADLINE_MS: Long = 30_000
     }
 
     class ResultHandler(
