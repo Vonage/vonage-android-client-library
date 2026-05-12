@@ -182,7 +182,15 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
             return convertError("sdk_connection_error", "ex: ".plus(ex.localizedMessage ?: ex.toString()))
         } finally {
             if (this::socket.isInitialized && !socket.isClosed) {
-                stopConnection()
+                try {
+                    stopConnection()
+                } catch (e: Exception) {
+                    tracer.addDebug(
+                        Log.ERROR,
+                        TAG,
+                        "Exception received whilst closing the socket ${e.localizedMessage}"
+                    )
+                }
             }
         }
     }
