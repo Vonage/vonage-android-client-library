@@ -179,7 +179,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
             return convertError("sdk_error", "internal error")
         } catch (ex: Exception) {
             tracer.addDebug(Log.DEBUG, TAG, "Cannot complete post: $url")
-            return convertError("sdk_connection_error", "ex: ".plus(ex.localizedMessage ?: ex.toString()))
+            return convertError("sdk_connection_error", "Connection failed: ".plus(ex.localizedMessage ?: ex.toString()))
         } finally {
             if (this::socket.isInitialized && !socket.isClosed) {
                 try {
