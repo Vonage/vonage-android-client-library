@@ -18,6 +18,7 @@ import androidx.annotation.RequiresApi
 import java.net.URL
 import java.util.Timer
 import java.util.TimerTask
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.schedule
 import kotlin.concurrent.withLock
@@ -129,6 +130,7 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
         try {
             val lock = ReentrantLock()
             val condition = lock.newCondition()
+            var signaled = false
 
             val capabilities = intArrayOf(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             val transportTypes = intArrayOf(NetworkCapabilities.TRANSPORT_CELLULAR)
@@ -138,12 +140,17 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
                     // We have Mobile Data registered and bound for use
                     // However, user may still have no data plan!
                     onCompletion(isOnCellular)
+                    signaled = true
                     condition.signal()
                 }
             }
 
             lock.withLock {
-                condition.await()
+                // Guard against the lost-signal race: if the callback already fired
+                // and set signaled=true before we reached await(), skip the wait.
+                if (!signaled) {
+                    condition.await(EXECUTE_TIMEOUT, TimeUnit.MILLISECONDS)
+                }
             }
         } catch (ex: Exception) {
             tracer.addDebug(Log.ERROR, TAG, "execute exception ${ex.message}")
@@ -369,6 +376,8 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
     companion object {
         private const val TAG = "CellularNetworkManager"
         private const val TIME_OUT: Long = 5000
+        /** Slightly longer than TIME_OUT to allow the network callback to fire first. */
+        private const val EXECUTE_TIMEOUT: Long = 6000
     }
 
     private fun boundNetwork() { // API 23
