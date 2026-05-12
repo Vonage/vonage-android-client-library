@@ -12,6 +12,7 @@ import java.net.URL
 import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets
 import java.util.UUID
+import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 import org.json.JSONException
 import org.json.JSONObject
@@ -88,9 +89,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         cmd.append("POST " + url.path)
         cmd.append(" HTTP/1.1$CRLF")
         cmd.append("Host: " + url.host)
-        if (url.protocol == "https" && url.port > 0 && url.port != PORT_443) {
-            cmd.append(":" + url.port)
-        } else if (url.protocol == "http" && url.port > 0 && url.port != PORT_80) {
+        if (url.port > 0 && url.port != PORT_443) {
             cmd.append(":" + url.port)
         }
         cmd.append(CRLF)
@@ -170,14 +169,30 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
     }
 
     fun post(url: URL, headers: Map<String, String>, body: String?): JSONObject {
-        startConnection(url)
-        val request = makePost(url, headers, body)
-        val response = sendAndReceive(request)
-        stopConnection()
-        if (response != null) {
-            return convertResultHandler(response)
+        try {
+            startConnection(url)
+            val request = makePost(url, headers, body)
+            val response = sendAndReceive(request)
+            if (response != null) {
+                return convertResultHandler(response)
+            }
+            return convertError("sdk_error", "internal error")
+        } catch (ex: Exception) {
+            tracer.addDebug(Log.DEBUG, TAG, "Cannot complete post: $url")
+            return convertError("sdk_connection_error", "Connection failed: ${ex.localizedMessage ?: ex}")
+        } finally {
+            if (this::socket.isInitialized) {
+                try {
+                    stopConnection()
+                } catch (e: Exception) {
+                    tracer.addDebug(
+                        Log.ERROR,
+                        TAG,
+                        "Exception received while closing the socket ${e.localizedMessage}"
+                    )
+                }
+            }
         }
-        return convertError("sdk_error", "internal error")
     }
 
     private fun makeHTTPCommand(
@@ -198,9 +213,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         }
         cmd.append(" HTTP/1.1$CRLF")
         cmd.append("Host: " + url.host)
-        if (url.protocol == "https" && url.port > 0 && url.port != PORT_443) {
-            cmd.append(":" + url.port)
-        } else if (url.protocol == "http" && url.port > 0 && url.port != PORT_80) {
+        if (url.port > 0 && url.port != PORT_443) {
             cmd.append(":" + url.port)
         }
         cmd.append(CRLF)
@@ -250,18 +263,21 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
     }
 
     private fun startConnection(url: URL) {
-        var port = PORT_80
+        if (url.protocol != "https") {
+            throw IOException("Only HTTPS URLs are supported. Received: ${url.protocol}://")
+        }
+        var port = PORT_443
         if (url.port > 0) port = url.port
         tracer.addDebug(Log.DEBUG, TAG, "start : ${url.host} ${url.port} ${url.protocol}")
         tracer.addTrace("\nStart connection ${url.host} ${url.port} ${url.protocol} ${DateUtils.now()}\n")
         try {
-            socket = if (url.protocol == "https") {
-                port = PORT_443
-                if (url.port > 0) port = url.port
-                SSLSocketFactory.getDefault().createSocket(url.host, port)
-            } else {
-                Socket(url.host, port)
-            }
+            val sslSocket = SSLSocketFactory.getDefault().createSocket(url.host, port) as SSLSocket
+            sslSocket.soTimeout = 5 * 1000
+            val params = sslSocket.sslParameters
+            params.endpointIdentificationAlgorithm = "HTTPS"
+            sslSocket.sslParameters = params
+            sslSocket.startHandshake()
+            socket = sslSocket
         } catch (ex: Exception) {
             tracer.addDebug(Log.ERROR, TAG, "Cannot create socket exception : ${ex.message}")
             tracer.addTrace("Cannot create socket exception ${ex.message}\n")
@@ -273,7 +289,6 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                 TAG,
                 "Client created : ${socket.inetAddress.hostAddress} ${socket.port}"
             )
-            socket.soTimeout = 5 * 1000
             output = socket.getOutputStream()
             input = BufferedReader(InputStreamReader(socket.inputStream))
             tracer.addDebug(
@@ -404,12 +419,18 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
             // some location header are not properly encoded
             var cleanRedirect = redirect.replace(" ", "+")
             tracer.addDebug(Log.DEBUG, TAG, "cleanRedirect : $cleanRedirect")
-            if (!cleanRedirect.startsWith("http")) { // http & https
+            if (!cleanRedirect.startsWith("http")) { // relative redirect
                 return ResultHandler(httpStatus, URL(requestURL, cleanRedirect), null, cookies)
+            }
+            val redirectUrl = URL(cleanRedirect)
+            if (requestURL.protocol == "https" && redirectUrl.protocol == "http") {
+                tracer.addDebug(Log.DEBUG, TAG, "Blocked HTTPS-to-HTTP redirect downgrade")
+                tracer.addTrace("Blocked HTTPS-to-HTTP redirect downgrade\n")
+                return null
             }
             tracer.addDebug(Log.DEBUG, TAG, "Found redirect")
             tracer.addTrace("Found redirect - ${DateUtils.now()} \n")
-            return ResultHandler(httpStatus, URL(cleanRedirect), null, cookies)
+            return ResultHandler(httpStatus, redirectUrl, null, cookies)
         }
         return null
     }
@@ -455,7 +476,6 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
     companion object {
         private const val TAG = "CellularClient"
         private const val HEADER_USER_AGENT = "User-Agent"
-        private const val PORT_80 = 80
         private const val PORT_443 = 443
         private const val CRLF = "\r\n"
     }
