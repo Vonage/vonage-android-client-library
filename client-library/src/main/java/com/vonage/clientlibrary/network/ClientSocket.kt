@@ -429,6 +429,15 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         }
     }
 
+    /**
+     * Returns a best-effort guess of whether the app is running on an emulator, based on
+     * easily-spoofed [Build] properties.
+     *
+     * **This is NOT a security control.** A determined attacker can trivially set any of these
+     * build properties to bypass this check. Its sole purpose is a convenience hint for
+     * sandbox/debug routing (the `x-silentauth-mode: sandbox` header). Do not rely on it
+     * to restrict access, enforce licensing, or make any trust decision.
+     */
     private fun isEmulator(): Boolean {
         return Build.FINGERPRINT.contains("generic") ||
                 Build.FINGERPRINT.startsWith("unknown") ||
