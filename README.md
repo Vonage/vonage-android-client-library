@@ -77,6 +77,12 @@ if (response.optString("error") != "") {
 
 Potential error codes: `sdk_no_data_connectivity`, `sdk_connection_error`, `sdk_redirect_error`, `sdk_error`.
 
+## Logging
+
+The SDK logs detailed request and response data (URLs, headers, body content) to help with debugging. This output is gated behind `BuildConfig.DEBUG` and is **only emitted in debug builds** — it is automatically suppressed in release builds.
+
+If you need to inspect SDK network activity during development, build and run your app in debug mode and filter logcat by the `ClientSocket` tag.
+
 ## Migrating from `com.vonage:client-sdk-silent-auth` or `com.vonage:client-sdk-number-verification`
 
 `com.vonage:client-library` replaces both `com.vonage:client-sdk-silent-auth` and `com.vonage:client-sdk-number-verification`
