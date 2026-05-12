@@ -2,7 +2,6 @@ package com.vonage.clientlibrary.network
 
 import android.os.Build
 import android.util.Log
-import com.vonage.clientlibrary.BuildConfig
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStream
@@ -17,7 +16,10 @@ import javax.net.ssl.SSLSocketFactory
 import org.json.JSONException
 import org.json.JSONObject
 
-internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollector.instance) {
+internal class ClientSocket constructor(
+    var tracer: TraceCollector = TraceCollector.instance,
+    private val isDebuggable: Boolean = false
+) {
     private lateinit var socket: Socket
     private lateinit var output: OutputStream
     private lateinit var input: BufferedReader
@@ -111,7 +113,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
     }
 
     private fun sendAndReceive(request: String): ResponseHandler? {
-        if (BuildConfig.DEBUG) tracer.addDebug(Log.DEBUG, TAG, "Client sending \n$request\n")
+        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Client sending \n$request\n")
         try {
             val bytesOfRequest: ByteArray =
                 request.toByteArray(Charset.forName(StandardCharsets.UTF_8.name()))
@@ -128,14 +130,14 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         var chunked: Boolean = false
         try {
             var response: String? = readMultipleChars(input, 65536)
-            if (BuildConfig.DEBUG) {
+            if (isDebuggable) {
                 tracer.addDebug(Log.DEBUG, TAG, "$response \n")
                 tracer.addDebug(Log.DEBUG, TAG, "--------\n")
             }
             response?.let {
                 val lines = response.split("\n")
                 for (line in lines) {
-                    if (BuildConfig.DEBUG) {
+                    if (isDebuggable) {
                         tracer.addDebug(Log.DEBUG, TAG, line)
                         tracer.addTrace(line)
                     }
@@ -154,7 +156,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                         // do nothing
                     } else {
                         body += line.replace("\r", "")
-                        if (BuildConfig.DEBUG) tracer.addDebug(Log.DEBUG, TAG, "Adding to body - $body\n")
+                        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Adding to body - $body\n")
                     }
                 }
                 if (chunked && !body.isNullOrBlank()) {
@@ -164,7 +166,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                         body = body.substring(r1, r2 + 1)
                     }
                 }
-                if (BuildConfig.DEBUG) tracer.addDebug(Log.DEBUG, TAG, "Status - $status [$chunked]\nBody - $body\n")
+                if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Status - $status [$chunked]\nBody - $body\n")
                 result = ResponseHandler(status, body)
             }
         } catch (ex: Exception) {
@@ -300,7 +302,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         message: String,
         existingCookies: ArrayList<HttpCookie>?
     ): ResultHandler? {
-        if (BuildConfig.DEBUG) {
+        if (isDebuggable) {
             tracer.addDebug(Log.DEBUG, TAG, "Client sending \n$message\n")
             tracer.addTrace(message)
         }
@@ -330,7 +332,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
             response?.let {
                 val lines = response.split("\n")
                 for (line in lines) {
-                    if (BuildConfig.DEBUG) {
+                    if (isDebuggable) {
                         tracer.addDebug(Log.DEBUG, TAG, line)
                         tracer.addTrace(line)
                     }
@@ -347,7 +349,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                             try {
                                 for (cookie in HttpCookie.parse(parts[1])) {
                                     cookies.add(cookie)
-                                    if (BuildConfig.DEBUG) {
+                                    if (isDebuggable) {
                                         tracer.addDebug(Log.DEBUG, TAG, "cookie - $cookie")
                                         tracer.addTrace("cookie - $cookie\n")
                                     }
@@ -371,10 +373,10 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                             "\r",
                             ""
                         )
-                        if (BuildConfig.DEBUG) tracer.addDebug(Log.DEBUG, TAG, "Adding to body - $body\n")
+                        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Adding to body - $body\n")
                     }
                 }
-                if (BuildConfig.DEBUG) tracer.addDebug(Log.DEBUG, TAG, "Status - $status\nBody - $body\n")
+                if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Status - $status\nBody - $body\n")
                 tracer.addTrace("Status - $status ${DateUtils.now()}\n")
                 result = if (result != null)
                     return result
