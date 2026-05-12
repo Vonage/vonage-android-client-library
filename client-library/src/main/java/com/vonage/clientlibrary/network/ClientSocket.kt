@@ -256,6 +256,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
         tracer.addTrace("\nStart connection ${url.host} ${url.port} ${url.protocol} ${DateUtils.now()}\n")
         try {
             val sslSocket = SSLSocketFactory.getDefault().createSocket(url.host, port) as SSLSocket
+            sslSocket.soTimeout = 5 * 1000
             val params = sslSocket.sslParameters
             params.endpointIdentificationAlgorithm = "HTTPS"
             sslSocket.sslParameters = params
@@ -272,7 +273,6 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                 TAG,
                 "Client created : ${socket.inetAddress.hostAddress} ${socket.port}"
             )
-            socket.soTimeout = 5 * 1000
             output = socket.getOutputStream()
             input = BufferedReader(InputStreamReader(socket.inputStream))
             tracer.addDebug(
