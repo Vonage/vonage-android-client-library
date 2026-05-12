@@ -169,14 +169,22 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
     }
 
     fun post(url: URL, headers: Map<String, String>, body: String?): JSONObject {
-        startConnection(url)
-        val request = makePost(url, headers, body)
-        val response = sendAndReceive(request)
-        stopConnection()
-        if (response != null) {
-            return convertResultHandler(response)
+        try {
+            startConnection(url)
+            val request = makePost(url, headers, body)
+            val response = sendAndReceive(request)
+            if (response != null) {
+                return convertResultHandler(response)
+            }
+            return convertError("sdk_error", "internal error")
+        } catch (ex: Exception) {
+            tracer.addDebug(Log.DEBUG, TAG, "Cannot complete post: $url")
+            return convertError("sdk_connection_error", "ex: ".plus(ex.localizedMessage))
+        } finally {
+            if (this::socket.isInitialized && !socket.isClosed) {
+                stopConnection()
+            }
         }
-        return convertError("sdk_error", "internal error")
     }
 
     private fun makeHTTPCommand(
