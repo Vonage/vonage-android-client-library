@@ -188,7 +188,7 @@ internal class ClientSocket constructor(var tracer: TraceCollector = TraceCollec
                     tracer.addDebug(
                         Log.ERROR,
                         TAG,
-                        "Exception received whilst closing the socket ${e.localizedMessage}"
+                        "Exception received while closing the socket ${e.localizedMessage}"
                     )
                 }
             }
