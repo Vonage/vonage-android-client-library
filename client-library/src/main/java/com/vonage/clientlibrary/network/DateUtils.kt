@@ -13,7 +13,8 @@ class DateUtils {
     companion object {
         // DEVX-11226: SimpleDateFormat is not thread-safe. Use ThreadLocal so each thread
         // gets its own instance, avoiding data races when logging is concurrent.
-        // Also fixes the format pattern: 'ssssss' (seconds repeated) → 'SSS' (milliseconds).
+        // Also fixes the format pattern: 'ssssss' (seconds zero-padded to 6 digits, e.g. '000045')
+        // → 'SSS' (milliseconds, 3 digits).
         // Note: ThreadLocal.withInitial{} requires API 26+; anonymous initialValue() works on all supported levels.
         private val simpleDateFormat: ThreadLocal<SimpleDateFormat> =
             object : ThreadLocal<SimpleDateFormat>() {
@@ -34,7 +35,7 @@ class DateUtils {
             return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 DateTimeFormatter.ISO_INSTANT.format(Instant.now())
             } else {
-                simpleDateFormat.get()!!.format(Date())
+                simpleDateFormat.get().format(Date())
             }
         }
     }
