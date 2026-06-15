@@ -2,6 +2,7 @@ package com.vonage.clientlibrary.network
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -27,6 +28,9 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
     private val cellularInfo by lazy {
         context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
     }
+
+    private val isDebuggable: Boolean =
+        (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
     private val connectivityManager by lazy {
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -62,7 +66,7 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
                 }
                 // We have Mobile Data registered and bound for use
                 // However, user may still have no data plan!
-                val cs = ClientSocket()
+                val cs = ClientSocket(isDebuggable = isDebuggable)
                 if (debug) tracer.startTrace()
                 response = cs.open(url, headers, getOperator(), maxRedirectCount)
                 if (debug) {
@@ -92,7 +96,7 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
             if (it) {
                 // We have Mobile Data registered and bound for use
                 // However, user may still have no data plan!
-                val cs = ClientSocket()
+                val cs = ClientSocket(isDebuggable = isDebuggable)
                 response = cs.post(url, headers, body)
             } else {
                 tracer.addDebug(Log.DEBUG, TAG, "We do not have a path")
