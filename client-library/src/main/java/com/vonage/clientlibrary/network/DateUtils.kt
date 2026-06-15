@@ -24,13 +24,17 @@ class DateUtils {
             }
 
         /**
-         * Returns the ISO-8601 formatted date in UTC, such as '2011-12-03T10:15:30.123Z'
+         * Returns the current time as an ISO-8601 UTC string.
+         * On API 26+, uses DateTimeFormatter.ISO_INSTANT: fractional seconds are omitted when
+         * zero and may be 1–9 digits otherwise (e.g. '2011-12-03T10:15:30Z').
+         * On API < 26, uses SimpleDateFormat with millisecond precision
+         * (e.g. '2011-12-03T10:15:30.123Z').
          */
         public fun now(): String {
             return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 DateTimeFormatter.ISO_INSTANT.format(Instant.now())
             } else {
-                requireNotNull(simpleDateFormat.get()).format(Date())
+                simpleDateFormat.get()!!.format(Date())
             }
         }
     }
