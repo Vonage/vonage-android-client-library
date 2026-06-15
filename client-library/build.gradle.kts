@@ -107,8 +107,6 @@ dependencies {
     implementation (libs.androidx.appcompat)
     implementation (libs.kotlin.stdlib)
     implementation (libs.androidx.core.ktx)
-    implementation (libs.okhttp)
-    implementation (libs.logging.interceptor)
 }
 java {
     toolchain {
