@@ -110,11 +110,14 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
     }
 
     private fun execute(onCompletion: (isSuccess: Boolean) -> Unit) {
-        // DEVX-11224: Fast-path — if cellular is already available and bound to the
-        // process, skip the expensive requestNetwork() flow (which can wait up to 5s
-        // for network acquisition even when cellular is already active).
-        if (isCellularAvailable() && isCellularBoundToProcess()) {
-            tracer.addDebug(Log.DEBUG, TAG, "Fast-path: cellular already available and bound")
+        // DEVX-11224: Fast-path — skip the expensive requestNetwork() flow (which can wait
+        // up to 5s) if cellular is already the active network, or is available and bound to
+        // the process. The active-network check is the primary trigger for successive requests:
+        // forceCellular() always calls bind(null) in its finally block, so isCellularBoundToProcess()
+        // won't be true after a prior call, but isCellularActiveNetwork() will still be true if
+        // cellular remains the active network.
+        if (isCellularActiveNetwork() || (isCellularAvailable() && isCellularBoundToProcess())) {
+            tracer.addDebug(Log.DEBUG, TAG, "Fast-path: cellular already active or available and bound")
             onCompletion(true)
             return
         }
@@ -352,6 +355,11 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
             }
         }
         return false
+    }
+
+    // minSdk = 24 >= M (23), so activeNetwork is always available — no API guard needed.
+    private fun isCellularActiveNetwork(): Boolean {
+        return connectivityManager.activeNetwork?.let { isCellular(it) } ?: false
     }
 
     companion object {
