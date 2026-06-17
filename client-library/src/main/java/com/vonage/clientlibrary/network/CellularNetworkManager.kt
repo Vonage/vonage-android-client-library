@@ -15,13 +15,13 @@ import android.os.Looper
 import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.annotation.RequiresApi
+import org.json.JSONObject
 import java.net.URL
 import java.util.Timer
 import java.util.TimerTask
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.schedule
 import kotlin.concurrent.withLock
-import org.json.JSONObject
 
 internal class CellularNetworkManager(context: Context) : NetworkManager {
 
@@ -275,11 +275,7 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
     }
 
     private fun bind(network: Network?) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-            ConnectivityManager.setProcessDefaultNetwork(network)
-        } else {
-            connectivityManager.bindProcessToNetwork(network) // API Level 23, 6.0 Marsh
-        }
+        connectivityManager.bindProcessToNetwork(network)
     }
 
     private fun requestNetwork(request: NetworkRequest, onCompletion: (isSuccess: Boolean) -> Unit) {
@@ -353,10 +349,8 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
     }
 
     private fun isCellularBoundToProcess(): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) { // API 23
-            connectivityManager.boundNetworkForProcess?.let {
-                return isCellular(it)
-            }
+        connectivityManager.boundNetworkForProcess?.let {
+            return isCellular(it)
         }
         return false
     }
@@ -372,17 +366,13 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
     }
 
     private fun boundNetwork() { // API 23
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            tracer.addDebug(Log.DEBUG, TAG, "----- Bound network ----")
-            connectivityManager.boundNetworkForProcess?.let { networkInfo(it) }
-        }
+        tracer.addDebug(Log.DEBUG, TAG, "----- Bound network ----")
+        connectivityManager.boundNetworkForProcess?.let { networkInfo(it) }
     }
 
     private fun activeNetworkInfo() { // API 23
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            tracer.addDebug(Log.DEBUG, TAG, "---- Active network ----")
-            connectivityManager.activeNetwork?.let { networkInfo(it) }
-        }
+        tracer.addDebug(Log.DEBUG, TAG, "---- Active network ----")
+        connectivityManager.activeNetwork?.let { networkInfo(it) }
     }
 
     @RequiresApi(api = Build.VERSION_CODES.R) // 30
