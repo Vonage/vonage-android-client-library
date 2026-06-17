@@ -203,14 +203,30 @@ internal class ClientSocket constructor(
     }
 
     fun post(url: URL, headers: Map<String, String>, body: String?): JSONObject {
-        startConnection(url)
-        val request = makePost(url, headers, body)
-        val response = sendAndReceive(request)
-        stopConnection()
-        if (response != null) {
-            return convertResultHandler(response)
+        try {
+            startConnection(url)
+            val request = makePost(url, headers, body)
+            val response = sendAndReceive(request)
+            if (response != null) {
+                return convertResultHandler(response)
+            }
+            return convertError("sdk_error", "internal error")
+        } catch (ex: Exception) {
+            tracer.addDebug(Log.DEBUG, TAG, "Cannot complete post: $url")
+            return convertError("sdk_connection_error", "Connection failed: ${ex.localizedMessage ?: ex}")
+        } finally {
+            if (this::socket.isInitialized) {
+                try {
+                    stopConnection()
+                } catch (e: Exception) {
+                    tracer.addDebug(
+                        Log.ERROR,
+                        TAG,
+                        "Exception received while closing the socket ${e.localizedMessage}"
+                    )
+                }
+            }
         }
-        return convertError("sdk_error", "internal error")
     }
 
     private fun makeHTTPCommand(
@@ -335,7 +351,7 @@ internal class ClientSocket constructor(
         message: String,
         existingCookies: ArrayList<HttpCookie>?
     ): ResultHandler? {
-        tracer.addDebug(Log.DEBUG, TAG, "Client sending \n$message\n")
+        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Client sending \n$message\n")
         tracer.addTrace(message)
         try {
             val bytesOfRequest: ByteArray =
@@ -413,6 +429,25 @@ internal class ClientSocket constructor(
                     (type == "application/json" || type == "application/hal+json" || type == "application/problem+json") && line.trimEnd('\r').isEmpty() -> {
                         bodyBegin = true
                     }
+                    line.trimEnd('\r').isEmpty() && earlyRedirect -> {
+                        // Blank line marks end of headers. For redirects with unknown body size,
+                        // break immediately to avoid hanging on keep-alive (DEVX-11221).
+                        if (contentLength < 0) {
+                            tracer.addTrace("Redirect with no Content-Length, breaking to avoid hang\n")
+                            break
+                        }
+                        // Known Content-Length: drain exact bytes to keep stream clean for reuse
+                        tracer.addTrace("Draining $contentLength bytes for redirect body\n")
+                        val discardBuffer = CharArray(contentLength)
+                        var totalRead = 0
+                        while (totalRead < contentLength) {
+                            val n = input.read(discardBuffer, totalRead, contentLength - totalRead)
+                            if (n <= 0) break
+                            totalRead += n
+                        }
+                        tracer.addTrace("Drained $totalRead bytes\n")
+                        break
+                    }
                     bodyBegin -> {
                         bodyBuilder.append(line.trimEnd('\r'))  // DEVX-11223: StringBuilder
                         if (BuildConfig.DEBUG) tracer.addDebug(Log.DEBUG, TAG, "Adding to body\n")
@@ -471,12 +506,18 @@ internal class ClientSocket constructor(
             // some location header are not properly encoded
             var cleanRedirect = redirect.replace(" ", "+")
             tracer.addDebug(Log.DEBUG, TAG, "cleanRedirect : $cleanRedirect")
-            if (!cleanRedirect.startsWith("http")) { // http & https
+            if (!cleanRedirect.startsWith("http")) { // relative redirect
                 return ResultHandler(httpStatus, URL(requestURL, cleanRedirect), null, cookies)
+            }
+            val redirectUrl = URL(cleanRedirect)
+            if (requestURL.protocol == "https" && redirectUrl.protocol == "http") {
+                tracer.addDebug(Log.DEBUG, TAG, "Blocked HTTPS-to-HTTP redirect downgrade")
+                tracer.addTrace("Blocked HTTPS-to-HTTP redirect downgrade\n")
+                return null
             }
             tracer.addDebug(Log.DEBUG, TAG, "Found redirect")
             tracer.addTrace("Found redirect - ${DateUtils.now()} \n")
-            return ResultHandler(httpStatus, URL(cleanRedirect), null, cookies)
+            return ResultHandler(httpStatus, redirectUrl, null, cookies)
         }
         return null
     }

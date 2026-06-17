@@ -43,32 +43,31 @@ android {
     testOptions {
         unitTests {
             isIncludeAndroidResources = true
+            all {
+                (this as? org.gradle.api.tasks.testing.Test)?.apply {
+                    testLogging {
+                        events("passed", "skipped", "failed")
+                    }
+                }
+            }
         }
     }
 }
 
 // Configure test tasks to use JVM 11 (required for MockK)
+// Must use afterEvaluate since Android Gradle Plugin creates these tasks late
 afterEvaluate {
-    tasks.named<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>("compileDebugUnitTestKotlin") {
-        kotlinOptions {
-            jvmTarget = "11"
+    tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
+        if (name.contains("UnitTest")) {
+            kotlinOptions.jvmTarget = "11"
         }
     }
 
-    tasks.named<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>("compileReleaseUnitTestKotlin") {
-        kotlinOptions {
-            jvmTarget = "11"
+    tasks.withType<JavaCompile> {
+        if (name.contains("UnitTest")) {
+            sourceCompatibility = "11"
+            targetCompatibility = "11"
         }
-    }
-
-    tasks.named<JavaCompile>("compileDebugUnitTestJavaWithJavac") {
-        sourceCompatibility = "11"
-        targetCompatibility = "11"
-    }
-
-    tasks.named<JavaCompile>("compileReleaseUnitTestJavaWithJavac") {
-        sourceCompatibility = "11"
-        targetCompatibility = "11"
     }
 }
 
@@ -138,8 +137,6 @@ dependencies {
     implementation (libs.androidx.appcompat)
     implementation (libs.kotlin.stdlib)
     implementation (libs.androidx.core.ktx)
-    implementation (libs.okhttp)
-    implementation (libs.logging.interceptor)
 
     // Testing dependencies
     testImplementation("junit:junit:4.13.2")
