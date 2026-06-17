@@ -39,6 +39,37 @@ android {
     kotlinOptions {
         jvmTarget = "1.8"
     }
+    
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+        }
+    }
+}
+
+// Configure test tasks to use JVM 11 (required for MockK)
+afterEvaluate {
+    tasks.named<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>("compileDebugUnitTestKotlin") {
+        kotlinOptions {
+            jvmTarget = "11"
+        }
+    }
+
+    tasks.named<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>("compileReleaseUnitTestKotlin") {
+        kotlinOptions {
+            jvmTarget = "11"
+        }
+    }
+
+    tasks.named<JavaCompile>("compileDebugUnitTestJavaWithJavac") {
+        sourceCompatibility = "11"
+        targetCompatibility = "11"
+    }
+
+    tasks.named<JavaCompile>("compileReleaseUnitTestJavaWithJavac") {
+        sourceCompatibility = "11"
+        targetCompatibility = "11"
+    }
 }
 
 publishing {
@@ -107,6 +138,14 @@ dependencies {
     implementation (libs.androidx.appcompat)
     implementation (libs.kotlin.stdlib)
     implementation (libs.androidx.core.ktx)
+    implementation (libs.okhttp)
+    implementation (libs.logging.interceptor)
+
+    // Testing dependencies
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("io.mockk:mockk:1.13.8")
+    testImplementation("org.jetbrains.kotlin:kotlin-test")
+    testImplementation("org.robolectric:robolectric:4.11.1")
 }
 java {
     toolchain {
