@@ -137,19 +137,24 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
 
             forceCellular(capabilities, transportTypes) { isOnCellular ->
                 lock.withLock {
-                    // We have Mobile Data registered and bound for use
-                    // However, user may still have no data plan!
-                    onCompletion(isOnCellular)
-                    signaled = true
-                    condition.signal()
+                    if (!signaled) {
+                        signaled = true
+                        onCompletion(isOnCellular)
+                        condition.signal()
+                    }
                 }
             }
 
             lock.withLock {
-                // Guard against the lost-signal race: if the callback already fired
-                // and set signaled=true before we reached await(), skip the wait.
+                val deadline = System.currentTimeMillis() + EXECUTE_TIMEOUT
+                while (!signaled) {
+                    val remaining = deadline - System.currentTimeMillis()
+                    if (remaining <= 0 || !condition.await(remaining, TimeUnit.MILLISECONDS)) break
+                }
                 if (!signaled) {
-                    condition.await(EXECUTE_TIMEOUT, TimeUnit.MILLISECONDS)
+                    signaled = true
+                    tracer.addDebug(Log.DEBUG, TAG, "execute timed out waiting for cellular callback")
+                    onCompletion(false)
                 }
             }
         } catch (ex: Exception) {
