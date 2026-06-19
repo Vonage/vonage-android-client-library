@@ -18,6 +18,7 @@ import androidx.annotation.RequiresApi
 import java.net.URL
 import java.util.Timer
 import java.util.TimerTask
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.schedule
 import kotlin.concurrent.withLock
@@ -129,21 +130,32 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
         try {
             val lock = ReentrantLock()
             val condition = lock.newCondition()
+            var signaled = false
 
             val capabilities = intArrayOf(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             val transportTypes = intArrayOf(NetworkCapabilities.TRANSPORT_CELLULAR)
 
             forceCellular(capabilities, transportTypes) { isOnCellular ->
                 lock.withLock {
-                    // We have Mobile Data registered and bound for use
-                    // However, user may still have no data plan!
-                    onCompletion(isOnCellular)
-                    condition.signal()
+                    if (!signaled) {
+                        signaled = true
+                        onCompletion(isOnCellular)
+                        condition.signal()
+                    }
                 }
             }
 
             lock.withLock {
-                condition.await()
+                val deadline = System.currentTimeMillis() + EXECUTE_TIMEOUT
+                while (!signaled) {
+                    val remaining = deadline - System.currentTimeMillis()
+                    if (remaining <= 0 || !condition.await(remaining, TimeUnit.MILLISECONDS)) break
+                }
+                if (!signaled) {
+                    signaled = true
+                    tracer.addDebug(Log.DEBUG, TAG, "execute timed out waiting for cellular callback")
+                    onCompletion(false)
+                }
             }
         } catch (ex: Exception) {
             tracer.addDebug(Log.ERROR, TAG, "execute exception ${ex.message}")
@@ -369,6 +381,8 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
     companion object {
         private const val TAG = "CellularNetworkManager"
         private const val TIME_OUT: Long = 5000
+        /** Slightly longer than TIME_OUT to allow the network callback to fire first. */
+        private const val EXECUTE_TIMEOUT: Long = 6000
     }
 
     private fun boundNetwork() { // API 23
