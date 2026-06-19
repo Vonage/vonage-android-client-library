@@ -1,16 +1,12 @@
-import java.util.Properties
+import com.vanniktech.maven.publish.AndroidSingleVariantLibrary
 
 val libraryVersion = "1.1.0"
 
 plugins {
     id("com.android.library")
     alias(libs.plugins.jetbrains.kotlin.android)
-    id("maven-publish")
-    id("signing")
+    alias(libs.plugins.vanniktech.maven.publish)
 }
-
-val localProperties = Properties()
-localProperties.load(project.rootProject.file("local.properties").inputStream())
 
 android {
     namespace = "com.vonage.clientlibrary"
@@ -41,7 +37,7 @@ android {
     kotlinOptions {
         jvmTarget = "1.8"
     }
-    
+
     testOptions {
         unitTests {
             isIncludeAndroidResources = true
@@ -72,66 +68,46 @@ afterEvaluate {
     }
 }
 
-publishing {
-    publications {
-        create<MavenPublication>("aar") {
-            groupId = "com.vonage"
-            artifactId = "client-library"
-            version = libraryVersion
-            artifact("$buildDir/outputs/aar/${project.name}-release.aar")
-            pom {
-                name = "Vonage Client Library"
-                description =
-                    "A library to support using the Vonage APIs on Android"
-                url = "https://github.com/Vonage/vonage-android-client-library"
-                licenses {
-                    license {
-                        name = "The Apache License, Version 2.0"
-                        url = "http://www.apache.org/licenses/LICENSE-2.0.txt"
-                    }
-                }
-                developers {
-                    developer {
-                        id = "vonage"
-                        name = "Vonage"
-                        email = "devrel@vonage.com"
-                    }
-                }
-                scm {
-                    connection = "scm:git:git:github.com/Vonage/vonage-android-client-library.git"
-                    developerConnection =
-                        "scm:git:ssh://github.com/Vonage/vonage-android-client-library.git"
-                    url = "https://github.com/Vonage/vonage-android-client-library"
-                }
+mavenPublishing {
+    // Publishes to the Sonatype Central Portal (central.sonatype.com).
+    // The legacy OSSRH staging API at oss.sonatype.org has been retired
+    // and now responds with HTTP 402 to upload requests.
+    publishToMavenCentral()
+    signAllPublications()
 
-                pom.withXml {
-                    val dependenciesNode = asNode().appendNode("dependencies")
-                    configurations.getByName("implementation").allDependencies.forEach {
-                        val dependencyNode = dependenciesNode.appendNode("dependency")
-                        dependencyNode.appendNode("groupId", it.group)
-                        dependencyNode.appendNode("artifactId", it.name)
-                        dependencyNode.appendNode("version", it.version)
+    coordinates("com.vonage", "client-library", libraryVersion)
 
-                    }
-                }
+    configure(
+        AndroidSingleVariantLibrary(
+            variant = "release",
+            sourcesJar = true,
+            publishJavadocJar = true,
+        )
+    )
+
+    pom {
+        name.set("Vonage Client Library")
+        description.set("A library to support using the Vonage APIs on Android")
+        url.set("https://github.com/Vonage/vonage-android-client-library")
+        licenses {
+            license {
+                name.set("The Apache License, Version 2.0")
+                url.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
             }
         }
-    }
-
-    repositories {
-        maven {
-            name = "OSSRH"
-            url = uri("https://oss.sonatype.org/service/local/staging/deploy/maven2/")
-            credentials {
-                username = localProperties["nexusUsername"].toString()
-                password = localProperties["nexusPassword"].toString()
+        developers {
+            developer {
+                id.set("vonage")
+                name.set("Vonage")
+                email.set("devrel@vonage.com")
             }
         }
+        scm {
+            connection.set("scm:git:git://github.com/Vonage/vonage-android-client-library.git")
+            developerConnection.set("scm:git:ssh://github.com/Vonage/vonage-android-client-library.git")
+            url.set("https://github.com/Vonage/vonage-android-client-library")
+        }
     }
-}
-
-signing {
-    sign(publishing.publications["aar"])
 }
 
 dependencies {
@@ -145,6 +121,7 @@ dependencies {
     testImplementation("org.jetbrains.kotlin:kotlin-test")
     testImplementation("org.robolectric:robolectric:4.11.1")
 }
+
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(17)

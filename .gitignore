@@ -5,6 +5,11 @@ build/
 # Local configuration file (sdk path, etc)
 local.properties
 
+# GPG home / signing material used by scripts/publish.sh — contains the
+# private signing key, agent sockets, and other developer-local state.
+# Never commit anything from this directory.
+publishing/
+
 # Log/OS Files
 *.log
 
