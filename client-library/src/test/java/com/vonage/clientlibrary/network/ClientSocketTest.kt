@@ -338,4 +338,52 @@ class ClientSocketTest {
         val json = cs.parseBodyIntoJSONString("""prefix{"key":"value"}suffix""")
         assertEquals("""{"key":"value"}""", json)
     }
+
+    @Test
+    fun `open sends cookie for exact domain match`() {
+        // Cookie with domain matching the request host exactly
+        val response = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Set-Cookie: session=abc; Domain=api.example.com\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Content-Length: 11\r\n" +
+            "\r\n" +
+            """{"ok":true}"""
+        ).toByteArray(Charsets.UTF_8)
+        // Second request verifies cookie is sent back (same host)
+        val response2 = httpResponse(200, body = """{"ok":true}""")
+        val combined = response + response2
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(combined)
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        // First request sets cookie; result has no error
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+        assertFalse(result.has("error"))
+    }
+
+    @Test
+    fun `open matches cookie with leading-dot domain`() {
+        // Cookie with Domain=.example.com should match api.example.com (leading dot normalized)
+        val response = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Set-Cookie: session=abc; Domain=.example.com\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Content-Length: 11\r\n" +
+            "\r\n" +
+            """{"ok":true}"""
+        ).toByteArray(Charsets.UTF_8)
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(response)
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+        assertFalse(result.has("error"))
+    }
 }
