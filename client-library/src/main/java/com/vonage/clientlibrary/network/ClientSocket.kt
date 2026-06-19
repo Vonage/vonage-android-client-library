@@ -288,9 +288,11 @@ internal class ClientSocket constructor(
         var cookieCount = 0
         val iterator = cookies.orEmpty().listIterator()
         for (cookie in iterator) {
-            val domainMatch = cookie.domain == null ||
-                url.host == cookie.domain ||
-                url.host.endsWith(".${cookie.domain}")
+            val normalizedHost = url.host.lowercase()
+            val normalizedDomain = cookie.domain?.trimStart('.')?.lowercase()
+            val domainMatch = normalizedDomain == null ||
+                normalizedHost == normalizedDomain ||
+                normalizedHost.endsWith(".$normalizedDomain")
             if (((cookie.secure && url.protocol == "https") || (!cookie.secure)) &&
                 domainMatch &&
                 (cookie.path == null || url.path.startsWith(cookie.path))

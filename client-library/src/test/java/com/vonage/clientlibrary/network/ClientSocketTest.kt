@@ -340,50 +340,83 @@ class ClientSocketTest {
     }
 
     @Test
-    fun `open sends cookie for exact domain match`() {
-        // Cookie with domain matching the request host exactly
-        val response = (
-            "HTTP/1.1 200 OK\r\n" +
+    fun `open sends cookie on redirect for exact domain match`() {
+        // First response: sets a cookie with exact domain, then redirects to same host
+        val redirect = (
+            "HTTP/1.1 302 Found\r\n" +
+            "Location: https://api.example.com/final\r\n" +
             "Set-Cookie: session=abc; Domain=api.example.com\r\n" +
-            "Content-Type: application/json\r\n" +
-            "Content-Length: 11\r\n" +
-            "\r\n" +
-            """{"ok":true}"""
+            "Content-Length: 0\r\n" +
+            "\r\n"
         ).toByteArray(Charsets.UTF_8)
-        // Second request verifies cookie is sent back (same host)
-        val response2 = httpResponse(200, body = """{"ok":true}""")
-        val combined = response + response2
+        val finalResponse = httpResponse(200, body = """{"ok":true}""")
+        val combined = redirect + finalResponse
+
+        val outputStream = ByteArrayOutputStream()
         every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
-        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getOutputStream() } returns outputStream
         every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(combined)
         every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
         every { mockSSLSocket.port } returns 443
 
         val cs = ClientSocket(mockTracer)
-        // First request sets cookie; result has no error
-        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
-        assertFalse(result.has("error"))
+        cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        val sentRequests = outputStream.toString(Charsets.UTF_8)
+        assertTrue("Cookie header should be sent on redirect", sentRequests.contains("Cookie: session=abc"))
     }
 
     @Test
-    fun `open matches cookie with leading-dot domain`() {
-        // Cookie with Domain=.example.com should match api.example.com (leading dot normalized)
-        val response = (
-            "HTTP/1.1 200 OK\r\n" +
-            "Set-Cookie: session=abc; Domain=.example.com\r\n" +
-            "Content-Type: application/json\r\n" +
-            "Content-Length: 11\r\n" +
-            "\r\n" +
-            """{"ok":true}"""
+    fun `open sends cookie on redirect for leading-dot domain`() {
+        // Domain=.example.com should match api.example.com after leading-dot normalization
+        val redirect = (
+            "HTTP/1.1 302 Found\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Set-Cookie: session=xyz; Domain=.example.com\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
         ).toByteArray(Charsets.UTF_8)
+        val finalResponse = httpResponse(200, body = """{"ok":true}""")
+        val combined = redirect + finalResponse
+
+        val outputStream = ByteArrayOutputStream()
         every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
-        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
-        every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(response)
+        every { mockSSLSocket.getOutputStream() } returns outputStream
+        every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(combined)
         every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
         every { mockSSLSocket.port } returns 443
 
         val cs = ClientSocket(mockTracer)
-        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
-        assertFalse(result.has("error"))
+        cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        val sentRequests = outputStream.toString(Charsets.UTF_8)
+        assertTrue("Cookie with leading-dot domain should be sent on redirect", sentRequests.contains("Cookie: session=xyz"))
+    }
+
+    @Test
+    fun `open does not send cookie for mismatched domain`() {
+        // Cookie with domain=other.example.com should not be sent to api.example.com
+        val redirect = (
+            "HTTP/1.1 302 Found\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Set-Cookie: session=nope; Domain=other.example.com\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        val finalResponse = httpResponse(200, body = """{"ok":true}""")
+        val combined = redirect + finalResponse
+
+        val outputStream = ByteArrayOutputStream()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns outputStream
+        every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(combined)
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        val sentRequests = outputStream.toString(Charsets.UTF_8)
+        assertFalse("Cookie for wrong domain should not be sent", sentRequests.contains("Cookie: session=nope"))
     }
 }
