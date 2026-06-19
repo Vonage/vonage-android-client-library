@@ -146,17 +146,10 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
             }
 
             lock.withLock {
-                // Guard against lost-signal race and spurious wakeups:
-                // loop on the predicate so spurious wakeups are re-checked, and
-                // skip the wait entirely if the callback already fired.
-                while (!signaled) {
-                    val timedOut = !condition.await(EXECUTE_TIMEOUT, TimeUnit.MILLISECONDS)
-                    if (timedOut && !signaled) {
-                        // Timeout with no completion — call onCompletion(false) exactly once.
-                        signaled = true
-                        onCompletion(false)
-                        break
-                    }
+                // Guard against the lost-signal race: if the callback already fired
+                // and set signaled=true before we reached await(), skip the wait.
+                if (!signaled) {
+                    condition.await(EXECUTE_TIMEOUT, TimeUnit.MILLISECONDS)
                 }
             }
         } catch (ex: Exception) {
