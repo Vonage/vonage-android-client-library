@@ -5,6 +5,7 @@ import android.net.Uri
 import com.vonage.clientlibrary.network.CellularNetworkManager
 import com.vonage.clientlibrary.network.NetworkManager
 import org.json.JSONObject
+import java.net.MalformedURLException
 import java.net.URL
 
 class VGCellularRequestClient private constructor(networkManager: CellularNetworkManager) {
@@ -36,7 +37,14 @@ class VGCellularRequestClient private constructor(networkManager: CellularNetwor
             uriBuilder.appendQueryParameter(key, value)
         }
         val uri = uriBuilder.build().toString()
-        return URL(uri)
+        val url = URL(uri)
+        if (url.protocol != "https") {
+            throw MalformedURLException("Only HTTPS URLs are supported. Received: ${url.protocol}://")
+        }
+        if (url.host.isNullOrEmpty()) {
+            throw MalformedURLException("URL must contain a non-empty host.")
+        }
+        return url
     }
 
     companion object {
@@ -45,10 +53,11 @@ class VGCellularRequestClient private constructor(networkManager: CellularNetwor
 
         @Synchronized
         fun initializeSdk(context: Context): VGCellularRequestClient {
+            val appContext = context.applicationContext
             var currentInstance = instance
-            if (null == currentInstance || currentContext != context) {
-                val nm = CellularNetworkManager(context)
-                currentContext = context
+            if (null == currentInstance || currentContext != appContext) {
+                val nm = CellularNetworkManager(appContext)
+                currentContext = appContext
                 currentInstance = VGCellularRequestClient(nm)
             }
             instance = currentInstance
