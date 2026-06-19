@@ -53,10 +53,11 @@ class VGCellularRequestClient private constructor(networkManager: CellularNetwor
 
         @Synchronized
         fun initializeSdk(context: Context): VGCellularRequestClient {
+            val appContext = context.applicationContext
             var currentInstance = instance
-            if (null == currentInstance || currentContext != context) {
-                val nm = CellularNetworkManager(context)
-                currentContext = context.applicationContext
+            if (null == currentInstance || currentContext != appContext) {
+                val nm = CellularNetworkManager(appContext)
+                currentContext = appContext
                 currentInstance = VGCellularRequestClient(nm)
             }
             instance = currentInstance
