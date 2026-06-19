@@ -23,7 +23,7 @@ import com.vonage.clientlibrary.VGCellularRequestParameters
 VGCellularRequestClient.initializeSdk(this.applicationContext)
 
 val params = VGCellularRequestClientParameters(
-    url = "https://www.vonage.com",
+    url = "http://www.vonage.com",
     headers = mapOf("x-my-header" to "My Value") ,
     queryParameters = mapOf("query-param" to "value"),
     maxRedirectCount = 10
@@ -45,7 +45,6 @@ if (response.optString("error") != "") {
 ```
 * `maxRedirectCount` in `VGCellularRequestParameters` is an optional and defaults to 10.
 * `debug` parameter for `startCellularRequest` is optional and defaults to false.
-* Only `https://` URLs are accepted. Passing an `http://` URL will throw a `MalformedURLException`.
 
 #### Responses
 
@@ -148,7 +147,7 @@ or
 ```kotlin
 // com.vonage:client-sdk-number-verification
 val params = VGNumberVerificationParameters(
-        url = "https://www.vonage.com",
+        url = "http://www.vonage.com",
         headers = mapOf("x-my-header" to "My Value") ,
         queryParameters = mapOf("query-param" to "value"),
         maxRedirectCount = 10
