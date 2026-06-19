@@ -54,17 +54,16 @@ android {
     }
 }
 
-// Configure test tasks to use JVM 11 (required for MockK)
-// Must use afterEvaluate since Android Gradle Plugin creates these tasks late
+// Configure test compile tasks to use JVM 11 (required for MockK)
 afterEvaluate {
-    tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
-        if (name.contains("UnitTest")) {
+    tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+        if (name.contains("UnitTest", ignoreCase = true)) {
             kotlinOptions.jvmTarget = "11"
         }
     }
 
-    tasks.withType<JavaCompile> {
-        if (name.contains("UnitTest")) {
+    tasks.withType<JavaCompile>().configureEach {
+        if (name.contains("UnitTest", ignoreCase = true)) {
             sourceCompatibility = "11"
             targetCompatibility = "11"
         }

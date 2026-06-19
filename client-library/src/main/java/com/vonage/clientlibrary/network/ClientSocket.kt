@@ -384,7 +384,7 @@ internal class ClientSocket constructor(
             tracer.addTrace("Client sending exception ${ex.message}\n")
             throw ex
         }
-        tracer.addDebug(Log.DEBUG, TAG, "Response\n")
+        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Response\n")
         tracer.addTrace("Response - ${DateUtils.now()} \n")
         var status: Int = 0
         var type: String = ""
@@ -408,7 +408,7 @@ internal class ClientSocket constructor(
                         val parts = line.split(" ")
                         if (parts.size >= 2) {
                             status = parts[1].trim().toIntOrNull() ?: 0
-                            tracer.addDebug(Log.DEBUG, TAG, "Status - $status")
+                            if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Status - $status")
                             tracer.addTrace("Status - $status ${DateUtils.now()}\n")
                         }
                     }
@@ -438,13 +438,13 @@ internal class ClientSocket constructor(
                         if (parts.size > 1) {
                             type = parts[1].replace(";", "")
                         }
-                        tracer.addDebug(Log.DEBUG, TAG, "Type - $type\n")
+                        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Type - $type\n")
                     }
                     line.startsWith("Content-Length:", ignoreCase = true) -> {
                         val parts = line.split(":")
                         if (parts.size > 1) {
                             contentLength = parts[1].trim().toIntOrNull() ?: -1
-                            tracer.addDebug(Log.DEBUG, TAG, "Content-Length - $contentLength")
+                            if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Content-Length - $contentLength")
                         }
                     }
                     (type == "application/json" || type == "application/hal+json" || type == "application/problem+json") && line.isEmpty() -> {

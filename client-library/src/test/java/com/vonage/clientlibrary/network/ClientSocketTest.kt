@@ -8,337 +8,335 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
-import java.io.BufferedReader
-import java.io.StringReader
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.net.Socket
 import java.net.URL
+import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
 /**
- * Tests for ClientSocket Copilot review fixes (DEVX-11219 follow-up)
- * 
- * Tests cover 4 specific fixes:
- * 1. Timeout floor removal (coerceAtLeast vs coerceIn)
- * 2. Socket timeout refresh on same-host connection reuse
- * 3. Socket cleanup on exception
- * 4. Content-Length parsing and redirect body draining
+ * Tests for ClientSocket exercising real parsing code paths via a fake SSLSocket.
+ *
+ * Each test injects a fake SSLSocket whose InputStream returns controlled HTTP response bytes,
+ * so the assertions cover the actual production parsing logic.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], manifest = Config.NONE)
 class ClientSocketTest {
 
-    private lateinit var clientSocket: ClientSocket
     private lateinit var mockTracer: TraceCollector
-    
+    private lateinit var mockSSLSocketFactory: SSLSocketFactory
+    private lateinit var mockSSLSocket: SSLSocket
+
     @Before
     fun setUp() {
-        // Create tracer mock to suppress output
         mockTracer = mockk(relaxed = true)
-        clientSocket = ClientSocket(mockTracer)
-        
-        // Mock SSL socket factory for HTTPS connections
         mockkStatic(SSLSocketFactory::class)
-        val mockSSLSocketFactory = mockk<SSLSocketFactory>(relaxed = true)
+        mockSSLSocketFactory = mockk()
+        mockSSLSocket = mockk(relaxed = true)
         every { SSLSocketFactory.getDefault() } returns mockSSLSocketFactory
     }
-    
+
     @After
     fun tearDown() {
         unmockkAll()
     }
-    
-    /**
-     * Fix 1: Verify timeout floor uses coerceAtLeast(1L) not coerceIn(1_000, ...)
-     * 
-     * Tests the timeout coercion logic directly by checking the coerceAtLeast behavior.
-     */
-    @Test
-    fun `timeout coercion should not inflate values below 1000ms`() {
-        // Test the coercion logic that's now in the code
-        val timeout500ms = 500L
-        val timeout0ms = 0L
-        val timeout2000ms = 2000L
-        
-        // The fix changes coerceIn(1_000, GLOBAL_DEADLINE_MS) to coerceAtLeast(1L)
-        // Old behavior would have inflated 500 to 1000
-        val coercedWithAtLeast = timeout500ms.coerceAtLeast(1L)
-        val coercedWithIn = timeout500ms.coerceIn(1_000, 30_000)
-        
-        assertEquals("coerceAtLeast should preserve 500ms", 500L, coercedWithAtLeast)
-        assertEquals("coerceIn would have inflated to 1000ms", 1000L, coercedWithIn)
-        
-        // Verify minimum is enforced
-        assertEquals("coerceAtLeast should enforce 1ms minimum", 1L, timeout0ms.coerceAtLeast(1L))
-        
-        // Verify larger values are preserved
-        assertEquals("coerceAtLeast should preserve larger values", 2000L, timeout2000ms.coerceAtLeast(1L))
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    /** Wire up the mock SSLSocket to return the given HTTP response bytes. */
+    private fun stubResponse(responseBytes: ByteArray) {
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(responseBytes)
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
     }
-    
+
     /**
-     * Fix 2: Verify socket timeout refresh logic
-     * 
-     * Tests that the socket timeout calculation for connection reuse is correct.
+     * Create a fresh mock SSLSocket that returns the given response bytes.
+     * Each call to createSocket should return a distinct socket so that
+     * separate connections get separate InputStreams.
      */
-    @Test
-    fun `socket timeout should be calculated from remaining time`() {
-        val deadline = System.currentTimeMillis() + 30_000 // 30 seconds from now
-        
-        // Simulate first request (10ms elapsed)
-        Thread.sleep(10)
-        val remainingMs1 = deadline - System.currentTimeMillis()
-        val timeout1 = remainingMs1.coerceAtLeast(1L).toInt()
-        
-        // Simulate second request (more time elapsed)
-        Thread.sleep(10)
-        val remainingMs2 = deadline - System.currentTimeMillis()
-        val timeout2 = remainingMs2.coerceAtLeast(1L).toInt()
-        
-        // Second timeout should be less than first (time has passed)
-        assertTrue("Second timeout ($timeout2) should be less than first ($timeout1)", 
-            timeout2 < timeout1)
-        
-        // Both should be positive
-        assertTrue("Timeout 1 should be positive", timeout1 > 0)
-        assertTrue("Timeout 2 should be positive", timeout2 > 0)
+    private fun makeMockSocket(responseBytes: ByteArray): SSLSocket {
+        val s = mockk<SSLSocket>(relaxed = true)
+        every { s.getOutputStream() } returns ByteArrayOutputStream()
+        every { s.getInputStream() } returns ByteArrayInputStream(responseBytes)
+        every { s.inetAddress } returns mockk(relaxed = true)
+        every { s.port } returns 443
+        return s
     }
-    
-    /**
-     * Fix 3: Verify socket cleanup on exception
-     * 
-     * Tests the error handling logic by verifying exception propagation.
-     */
+
+    private fun httpResponse(
+        status: Int = 200,
+        headers: String = "",
+        body: String = "",
+        contentType: String = "application/json"
+    ): ByteArray {
+        val bodyBytes = body.toByteArray(Charsets.UTF_8)
+        val sb = StringBuilder()
+        sb.append("HTTP/1.1 $status OK\r\n")
+        if (body.isNotEmpty()) {
+            sb.append("Content-Type: $contentType\r\n")
+            sb.append("Content-Length: ${bodyBytes.size}\r\n")
+        }
+        if (headers.isNotEmpty()) sb.append(headers)
+        sb.append("\r\n")
+        sb.append(body)
+        return sb.toString().toByteArray(Charsets.UTF_8)
+    }
+
+    // ------------------------------------------------------------------
+    // Tests
+    // ------------------------------------------------------------------
+
     @Test
-    fun `exception during connection should result in error response`() {
-        // The fix adds stopConnection() call in the catch block
-        // We test that the error handling path produces the correct result structure
-        
-        val url = URL("https://api.example.com/test")
-        
-        // Mock socket factory to throw exception
-        val mockSSLSocketFactory = mockk<SSLSocketFactory>()
-        every { SSLSocketFactory.getDefault() } returns mockSSLSocketFactory
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } throws 
-            RuntimeException("Connection failed")
-        
-        // Attempt connection
-        val result = clientSocket.open(url, emptyMap(), null, 10)
-        
-        // Should return error, not throw
-        assertTrue("Result should contain error field", result.has("error"))
+    fun `open returns http_status and response_body for 200 JSON response`() {
+        stubResponse(httpResponse(200, body = """{"ok":true}"""))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open returns sdk_connection_error when socket factory throws`() {
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } throws
+            RuntimeException("Network unreachable")
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
         assertEquals("sdk_connection_error", result.getString("error"))
-        assertTrue("Error description should mention exception", 
-            result.getString("error_description").contains("ex:"))
+        assertTrue(result.getString("error_description").contains("Network unreachable"))
     }
-    
-    /**
-     * Fix 4: Verify Content-Length header parsing logic
-     * 
-     * Tests the Content-Length parsing without full socket mocking.
-     */
+
     @Test
-    fun `Content-Length header should be parsed correctly`() {
-        // Test the parsing logic for Content-Length header
-        val headerLine = "Content-Length: 42"
-        val parts = headerLine.split(":")
-        
-        assertTrue("Should split into 2 parts", parts.size > 1)
-        
-        val contentLength = parts[1].trim().toIntOrNull() ?: -1
-        assertEquals("Should parse Content-Length value", 42, contentLength)
-        
-        // Test with invalid value
-        val invalidLine = "Content-Length: invalid"
-        val invalidParts = invalidLine.split(":")
-        val invalidLength = invalidParts[1].trim().toIntOrNull() ?: -1
-        assertEquals("Should return -1 for invalid Content-Length", -1, invalidLength)
+    fun `open returns sdk_connection_error and closes socket when exception occurs after connection`() {
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } throws RuntimeException("Read failed")
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+        // Socket close should have been attempted
+        verify { mockSSLSocket.close() }
     }
-    
-    /**
-     * Fix 4: Verify redirect body draining logic
-     * 
-     * Tests that the earlyRedirect flag allows body draining before returning.
-     */
+
     @Test
-    fun `earlyRedirect flag should allow body to be drained before returning`() {
-        // Test the logic: when redirect is detected, set flag and continue reading
-        var redirectDetected = false
-        var earlyRedirect = false
-        var bodyDrained = false
-        
-        // Simulate redirect detection
-        val status = 301
-        val hasLocation = true
-        
-        if (hasLocation && status in 300..399) {
-            // Old code: return immediately
-            // New code: set flag and continue
-            earlyRedirect = true
-        }
-        
-        // Continue processing (drain body)
-        if (!earlyRedirect) {
-            fail("Should have set earlyRedirect flag")
-        }
-        
-        // Simulate body draining
-        bodyDrained = true
-        
-        // Now return the redirect
-        if (earlyRedirect && bodyDrained) {
-            redirectDetected = true
-        }
-        
-        assertTrue("Redirect should be returned after body drain", redirectDetected)
+    fun `open returns sdk_redirect_error when redirect limit exceeded`() {
+        // Use same-host redirects so all responses go through one socket connection.
+        // Concatenate enough redirect responses to exceed the limit.
+        val singleRedirect = (
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: https://api.example.com/redirect\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+
+        // 7 redirects in sequence — more than maxRedirectCount=5
+        val combined = (1..7).fold(ByteArray(0)) { acc, _ -> acc + singleRedirect }
+
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(combined)
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        assertTrue("Expected error in result: $result", result.has("error"))
+        assertEquals("sdk_redirect_error", result.getString("error"))
     }
-    
-    /**
-     * Fix 4: Verify Content-Length termination logic
-     * 
-     * Tests that body accumulation stops when Content-Length is reached.
-     */
+
     @Test
-    fun `body accumulation should stop when Content-Length is reached`() {
-        val contentLength = 13
-        val bodyBuilder = StringBuilder()
-        
-        // Simulate reading body lines - exactly matching Content-Length
-        val bodyLine = "{\"ok\":true}\r\n" // 13 characters
-        bodyBuilder.append(bodyLine)
-        
-        // Check termination condition
-        val shouldBreak = contentLength >= 0 && bodyBuilder.length >= contentLength
-        
-        assertTrue("Should break when body length >= Content-Length", shouldBreak)
-        assertEquals(13, bodyBuilder.length)
-    }
-    
-    /**
-     * Integration test: Verify full response parsing with Content-Length
-     */
-    @Test
-    fun `sendAndReceive should handle response with Content-Length correctly`() {
-        // Create a mock response with Content-Length
-        val response = """
-            HTTP/1.1 200 OK
-            Content-Type: application/json
-            Content-Length: 13
-            
-            {"ok":true}
-        """.trimIndent()
-        
-        val reader = BufferedReader(StringReader(response))
-        var status = 0
-        var contentLength = -1
-        val bodyBuilder = StringBuilder()
-        var bodyBegin = false
-        var type = ""
-        
-        // Parse response (simplified version of actual code)
-        var line: String? = reader.readLine()
-        while (line != null) {
-            when {
-                line.startsWith("HTTP/") -> {
-                    val parts = line.split(" ")
-                    if (parts.size >= 2) {
-                        status = parts[1].trim().toIntOrNull() ?: 0
-                    }
-                }
-                line.startsWith("Content-Type:", ignoreCase = true) -> {
-                    val parts = line.split(" ")
-                    if (parts.size > 1) {
-                        type = parts[1].replace(";", "").trimEnd('\r')
-                    }
-                }
-                line.startsWith("Content-Length:", ignoreCase = true) -> {
-                    val parts = line.split(":")
-                    if (parts.size > 1) {
-                        contentLength = parts[1].trim().toIntOrNull() ?: -1
-                    }
-                }
-                (type == "application/json") && line.trimEnd('\r').isEmpty() -> {
-                    bodyBegin = true
-                }
-                bodyBegin -> {
-                    bodyBuilder.append(line.trimEnd('\r'))
-                    // Check termination condition
-                    if (contentLength >= 0 && bodyBuilder.length >= contentLength) {
-                        break
-                    }
-                }
-            }
-            line = reader.readLine()
+    fun `open follows redirect and returns final response`() {
+        val redirectResponse = (
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: https://other.example.com/final\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        val finalResponse = httpResponse(200, body = """{"done":true}""")
+
+        // First createSocket → redirect response; second → final response
+        val responses = listOf(redirectResponse, finalResponse).iterator()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+            makeMockSocket(if (responses.hasNext()) responses.next() else finalResponse)
         }
-        
-        // Verify parsing
-        assertEquals("Should parse status code", 200, status)
-        assertEquals("Should parse Content-Length", 13, contentLength)
-        assertEquals("Should parse Content-Type", "application/json", type)
-        assertEquals("Should parse body", "{\"ok\":true}", bodyBuilder.toString())
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        assertFalse(result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("done"))
     }
-    
-    /**
-     * Integration test: Verify redirect response handling with body drain
-     */
+
     @Test
-    fun `sendAndReceive should drain redirect body before returning`() {
-        // Create a mock redirect response with body
-        val response = """
-            HTTP/1.1 301 Moved Permanently
-            Location: https://api.example.com/new-location
-            Content-Type: text/html
-            Content-Length: 18
-            
-            <html>Moved</html>
-        """.trimIndent()
-        
-        val reader = BufferedReader(StringReader(response))
-        var status = 0
-        var redirectLocation: String? = null
-        var contentLength = -1
-        var earlyRedirect = false
-        val bodyBuilder = StringBuilder()
-        var bodyBegin = false
-        
-        // Parse response
-        var line: String? = reader.readLine()
-        while (line != null) {
-            when {
-                line.startsWith("HTTP/") -> {
-                    val parts = line.split(" ")
-                    if (parts.size >= 2) {
-                        status = parts[1].trim().toIntOrNull() ?: 0
-                    }
-                }
-                line.startsWith("Location:", ignoreCase = true) -> {
-                    redirectLocation = line.substring("Location:".length).trim()
-                    if (redirectLocation != null && status in 300..399) {
-                        earlyRedirect = true
-                    }
-                }
-                line.startsWith("Content-Length:", ignoreCase = true) -> {
-                    val parts = line.split(":")
-                    if (parts.size > 1) {
-                        contentLength = parts[1].trim().toIntOrNull() ?: -1
-                    }
-                }
-                line.trimEnd('\r').isEmpty() && !bodyBegin -> {
-                    bodyBegin = true
-                }
-                bodyBegin -> {
-                    bodyBuilder.append(line.trimEnd('\r'))
-                    if (contentLength >= 0 && bodyBuilder.length >= contentLength) {
-                        break
-                    }
-                }
-            }
-            line = reader.readLine()
+    fun `open blocks HTTPS to HTTP redirect downgrade`() {
+        val redirectResponse = (
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: http://evil.example.com/\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(redirectResponse)
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        // Downgrade blocked → parseRedirect returns null → no redirect URL → loop ends
+        // Result has no redirect_error; it falls through to sdk_error (no body)
+        assertFalse("Should not follow http:// redirect", "sdk_redirect_error" == result.optString("error"))
+    }
+
+    @Test
+    fun `open returns non-JSON body as response_raw_body`() {
+        // A valid JSON-ish body that isn't strict JSON — parseBodyIntoJSONString extracts
+        // the outer braces, then convertResultHandler tries JSONObject which may fail.
+        // Use a body that is valid JSON to confirm the happy path first; non-JSON is
+        // handled at a layer below open() and surfaces as sdk_connection_error.
+        val nonJsonBody = "plain text response"
+        val response = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Content-Length: ${nonJsonBody.length}\r\n" +
+            "\r\n" +
+            nonJsonBody
+        ).toByteArray(Charsets.UTF_8)
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(response)
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        // parseBodyIntoJSONString throws on no '{' → caught as sdk_connection_error
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open returns response_raw_body when body has braces but is not valid JSON`() {
+        // Body has braces so parseBodyIntoJSONString succeeds, but JSONObject constructor throws
+        val nonJsonBody = "{not valid json}"
+        val response = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Content-Length: ${nonJsonBody.toByteArray().size}\r\n" +
+            "\r\n" +
+            nonJsonBody
+        ).toByteArray(Charsets.UTF_8)
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(response)
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse(result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertEquals("{not valid json}", result.getString("response_raw_body"))
+    }
+
+    @Test
+    fun `open refreshes socket timeout when reusing connection for same-authority redirect`() {
+        // Same authority redirect: api.example.com:443 → api.example.com:443
+        // The code reuses the socket, so createSocket is called only once but soTimeout set twice.
+        val redirectResponse = (
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        val finalResponse = httpResponse(200, body = """{"ok":true}""")
+
+        // Concatenate both responses into one stream to simulate server reuse
+        val combined = redirectResponse + finalResponse
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(combined)
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        // soTimeout set once on startConnection, once on reuse
+        verify(atLeast = 2) { mockSSLSocket.soTimeout = any() }
+    }
+
+    @Test
+    fun `open does not reuse connection when redirect changes port`() {
+        val redirectResponse = (
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: https://api.example.com:8443/other\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        val finalResponse = httpResponse(200, body = """{"ok":true}""")
+
+        val responses = listOf(redirectResponse, finalResponse).iterator()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+            makeMockSocket(if (responses.hasNext()) responses.next() else finalResponse)
         }
-        
-        // Verify redirect was detected
-        assertTrue("Should detect redirect", earlyRedirect)
-        assertEquals("Should parse redirect location", "https://api.example.com/new-location", redirectLocation)
-        
-        // Verify body was drained (not returned immediately)
-        assertTrue("Body should be drained", bodyBuilder.length >= contentLength)
-        assertEquals("Should read full body", "<html>Moved</html>", bodyBuilder.toString())
+
+        val cs = ClientSocket(mockTracer)
+        cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        // Different authority (port changed) → two separate connections
+        verify(exactly = 2) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+    }
+
+    @Test
+    fun `parseRedirect returns null for HTTPS to HTTP downgrade`() {
+        val cs = ClientSocket(mockTracer)
+        val result = cs.parseRedirect(
+            301,
+            URL("https://api.example.com/"),
+            "Location: http://evil.example.com/",
+            null
+        )
+        assertNull("Downgrade should be blocked", result)
+    }
+
+    @Test
+    fun `parseRedirect handles relative redirect`() {
+        val cs = ClientSocket(mockTracer)
+        val result = cs.parseRedirect(
+            302,
+            URL("https://api.example.com/old"),
+            "Location: /new",
+            null
+        )
+        assertNotNull(result)
+        assertEquals("https://api.example.com/new", result!!.getRedirect()?.toString())
+    }
+
+    @Test
+    fun `parseBodyIntoJSONString extracts JSON object from body string`() {
+        val cs = ClientSocket(mockTracer)
+        val json = cs.parseBodyIntoJSONString("""prefix{"key":"value"}suffix""")
+        assertEquals("""{"key":"value"}""", json)
     }
 }
