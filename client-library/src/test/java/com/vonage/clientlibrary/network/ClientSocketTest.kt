@@ -10,7 +10,6 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.BufferedReader
 import java.io.StringReader
-import java.net.Socket
 import java.net.URL
 import javax.net.ssl.SSLSocketFactory
 
@@ -83,7 +82,7 @@ class ClientSocketTest {
     fun `socket timeout should be calculated from remaining time`() {
         val deadline = System.currentTimeMillis() + 30_000 // 30 seconds from now
         
-        // Simulate first request (10 seconds elapsed)
+        // Simulate first request (10ms elapsed)
         Thread.sleep(10)
         val remainingMs1 = deadline - System.currentTimeMillis()
         val timeout1 = remainingMs1.coerceAtLeast(1L).toInt()
