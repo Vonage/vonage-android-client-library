@@ -1,6 +1,6 @@
 import com.vanniktech.maven.publish.AndroidSingleVariantLibrary
 
-val libraryVersion = "1.2.0"
+val libraryVersion = "1.3.0-alpha01"
 
 plugins {
     id("com.android.library")
@@ -114,6 +114,8 @@ dependencies {
     implementation (libs.androidx.appcompat)
     implementation (libs.kotlin.stdlib)
     implementation (libs.androidx.core.ktx)
+    implementation (libs.androidx.credentials)
+    implementation (libs.androidx.credentials.play)
 
     // Testing dependencies
     testImplementation("junit:junit:4.13.2")
