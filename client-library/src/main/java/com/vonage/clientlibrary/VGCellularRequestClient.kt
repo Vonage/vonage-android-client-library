@@ -11,6 +11,22 @@ import java.net.URL
 class VGCellularRequestClient private constructor(networkManager: CellularNetworkManager) {
     private val networkManager: NetworkManager = networkManager
 
+    /**
+     * Returns the current cellular connectivity status of the device.
+     *
+     * Call this before initiating a Silent Authentication flow to determine whether
+     * cellular is available and select the appropriate Vonage Verify channel.
+     *
+     * This is a fast, synchronous check — it does not attempt a network connection.
+     *
+     * @return [CellularStatus.Available] if cellular is the active network,
+     *         [CellularStatus.AvailableNotActive] if a cellular interface exists but is not active,
+     *         [CellularStatus.Unavailable] if no cellular interface is detected.
+     */
+    fun getCellularStatus(): CellularStatus {
+        return networkManager.getCellularStatus()
+    }
+
     /* This method performs a GET request given a URL with cellular connectivity
     - Parameters:
       - params: Parameters to configure your GET request

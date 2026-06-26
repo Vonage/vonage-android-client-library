@@ -15,6 +15,7 @@ import android.os.Looper
 import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.annotation.RequiresApi
+import com.vonage.clientlibrary.CellularStatus
 import java.net.URL
 import java.util.Timer
 import java.util.TimerTask
@@ -42,6 +43,14 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
     private var timeoutTask: TimerTask? = null
 
     private val tracer = TraceCollector.instance
+
+    override fun getCellularStatus(): CellularStatus {
+        return when {
+            isCellularActiveNetwork() -> CellularStatus.Available
+            isCellularAvailable() -> CellularStatus.AvailableNotActive
+            else -> CellularStatus.Unavailable
+        }
+    }
 
     override fun openWithDataCellular(url: URL, headers: Map<String, String>?, maxRedirectCount: Int, debug: Boolean): JSONObject {
         var calledOnCellularNetwork = false
