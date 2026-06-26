@@ -1,5 +1,6 @@
 package com.vonage.clientlibrary
 
+import android.app.Activity
 import android.content.Context
 import android.net.Uri
 import com.vonage.clientlibrary.network.CellularNetworkManager
@@ -41,6 +42,31 @@ class VGCellularRequestClient private constructor(networkManager: CellularNetwor
             params.maxRedirectCount,
             debug
         )
+    }
+
+    /**
+     * Requests a Silent Auth Advanced operator token using the GSMA TS.43 SIM-based
+     * authentication flow.
+     *
+     * SAA works over Wi-Fi, VPN, and cellular — no data session forcing is needed.
+     * Call this after receiving `sim_based_authz_data` from your backend following
+     * a Vonage Verify `action_pending` event.
+     *
+     * This API is experimental. Opt in with `@OptIn(ExperimentalSaaApi::class)`.
+     *
+     * @param activity The Activity context required for credential UI presentation.
+     * @param authzData The parsed `sim_based_authz_data` payload.
+     * @param manager Optional custom [SilentAuthAdvancedManager]. Defaults to a new instance.
+     * @param callback Invoked with a [SaaResult] when the flow completes or fails.
+     */
+    @ExperimentalSaaApi
+    fun requestSilentAuthAdvancedToken(
+        activity: Activity,
+        authzData: SimBasedAuthzData,
+        manager: SilentAuthAdvancedManager = SilentAuthAdvancedManager(),
+        callback: (SaaResult) -> Unit
+    ) {
+        manager.requestOperatorToken(activity, authzData, callback)
     }
 
     private fun getCellularNetworkManager(): NetworkManager {
