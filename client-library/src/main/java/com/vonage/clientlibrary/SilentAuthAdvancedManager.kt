@@ -3,6 +3,11 @@ package com.vonage.clientlibrary
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import androidx.annotation.MainThread
+import androidx.credentials.exceptions.GetCredentialCancellationException
+import androidx.credentials.exceptions.GetCredentialUnsupportedException
 
 /**
  * Manages the Silent Auth Advanced (SAA) flow for GSMA TS.43 SIM-based authentication.
@@ -44,6 +49,8 @@ class SilentAuthAdvancedManager(
     private val tokenProvider: SaaTokenProvider = DefaultSaaTokenProvider()
 ) {
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     /**
      * Requests an operator token for the given [SimBasedAuthzData].
      *
@@ -52,12 +59,14 @@ class SilentAuthAdvancedManager(
      * is present, it falls back to a deep-link [Intent] that the host app can start
      * to open the carrier's native app.
      *
-     * The [callback] is always invoked exactly once, on the main thread.
+     * The [callback] is always invoked exactly once, on the main thread. Call this
+     * method from the main thread.
      *
      * @param activity The Activity context required for credential UI presentation.
      * @param authzData The `sim_based_authz_data` payload from the Vonage Verify callback.
      * @param callback Invoked with a [SaaResult] when the flow completes or fails.
      */
+    @MainThread
     fun requestOperatorToken(
         activity: Activity,
         authzData: SimBasedAuthzData,
@@ -66,7 +75,7 @@ class SilentAuthAdvancedManager(
         // Validate the payload before attempting anything
         val jwt = authzData.vpResponse.meta.credentialAuthorizationJwt
         if (jwt.isBlank()) {
-            callback(SaaResult.Error(
+            dispatch(callback, SaaResult.Error(
                 SaaErrorCode.MALFORMED_PAYLOAD,
                 "credential_authorization_jwt is missing or empty"
             ))
@@ -91,34 +100,25 @@ class SilentAuthAdvancedManager(
                 when {
                     token != null -> {
                         if (token.toByteArray(Charsets.UTF_8).size > MAX_TOKEN_BYTES) {
-                            callback(SaaResult.Error(
+                            dispatch(callback, SaaResult.Error(
                                 SaaErrorCode.TOKEN_TOO_LARGE,
                                 "Operator token exceeds the 5 KB size limit"
                             ))
                         } else {
-                            callback(SaaResult.Success(token))
+                            dispatch(callback, SaaResult.Success(token))
                         }
                     }
-                    error != null -> callback(mapProviderError(error, authzData.androidAppUrl))
-                    else -> callback(SaaResult.Error(SaaErrorCode.UNKNOWN, "No token and no error returned"))
+                    error != null -> dispatch(callback, mapProviderError(error, authzData))
+                    else -> dispatch(callback, SaaResult.Error(SaaErrorCode.UNKNOWN, "No token and no error returned"))
                 }
             }
         } else {
             // Native path unavailable — try deep-link fallback
-            val appUrl = authzData.androidAppUrl
-            if (!appUrl.isNullOrBlank()) {
-                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(appUrl)).apply {
-                    authzData.appInfoJwt?.let { jwt ->
-                        putExtra(EXTRA_APP_INFO_JWT, jwt)
-                    }
-                }
-                callback(SaaResult.DeepLinkRequired(intent))
-            } else {
-                callback(SaaResult.Error(
-                    SaaErrorCode.UNSUPPORTED_NETWORK,
-                    "Native TS.43 path is unavailable and no androidAppUrl fallback is provided"
-                ))
-            }
+            val deepLinkResult = buildDeepLinkResult(
+                authzData,
+                fallbackErrorMessage = "Native TS.43 path is unavailable and no androidAppUrl fallback is provided"
+            )
+            dispatch(callback, deepLinkResult)
         }
     }
 
@@ -126,24 +126,25 @@ class SilentAuthAdvancedManager(
      * Handles the token returned by the carrier's native app after a deep-link launch.
      *
      * Call this from your Activity's `onActivityResult` or from the intent that the
-     * carrier app returns to your app.
+     * carrier app returns to your app. The [callback] is invoked on the main thread.
      *
      * @param token The raw operator token string returned by the carrier app.
      * @param callback Invoked with a [SaaResult].
      */
+    @MainThread
     fun handleDeepLinkResult(
         token: String?,
         callback: (SaaResult) -> Unit
     ) {
         if (token.isNullOrBlank()) {
-            callback(SaaResult.Error(SaaErrorCode.CANCELLED, "No token returned from carrier app"))
+            dispatch(callback, SaaResult.Error(SaaErrorCode.CANCELLED, "No token returned from carrier app"))
             return
         }
         if (token.toByteArray(Charsets.UTF_8).size > MAX_TOKEN_BYTES) {
-            callback(SaaResult.Error(SaaErrorCode.TOKEN_TOO_LARGE, "Operator token exceeds the 5 KB size limit"))
+            dispatch(callback, SaaResult.Error(SaaErrorCode.TOKEN_TOO_LARGE, "Operator token exceeds the 5 KB size limit"))
             return
         }
-        callback(SaaResult.Success(token))
+        dispatch(callback, SaaResult.Success(token))
     }
 
     // ------------------------------------------------------------------
@@ -153,32 +154,77 @@ class SilentAuthAdvancedManager(
     private fun handleVirtualOperator(phoneHint: String, callback: (SaaResult) -> Unit) {
         val lastDigit = phoneHint.trimEnd().lastOrNull()?.digitToIntOrNull()
         when {
-            lastDigit == null -> callback(SaaResult.Error(
+            lastDigit == null -> dispatch(callback, SaaResult.Error(
                 SaaErrorCode.MALFORMED_PAYLOAD,
                 "Cannot determine last digit of virtual operator phone hint: $phoneHint"
             ))
-            lastDigit % 2 == 0 -> callback(SaaResult.Success(VIRTUAL_OPERATOR_TEST_TOKEN))
-            else -> callback(SaaResult.Error(
+            lastDigit % 2 == 0 -> dispatch(callback, SaaResult.Success(VIRTUAL_OPERATOR_TEST_TOKEN))
+            else -> dispatch(callback, SaaResult.Error(
                 SaaErrorCode.UNSUPPORTED_NETWORK,
                 "Virtual operator simulated failure for phone hint: $phoneHint"
             ))
         }
     }
 
-    private fun mapProviderError(error: Exception, androidAppUrl: String?): SaaResult {
-        // Try deep-link fallback before returning an error if the URL is available
-        if (!androidAppUrl.isNullOrBlank()) {
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(androidAppUrl))
-            return SaaResult.DeepLinkRequired(intent)
+    /**
+     * Translates a provider error into a [SaaResult].
+     *
+     * The deep-link fallback is only used when the error indicates that the native
+     * TS.43 path is not available on this device. User-cancellation and other
+     * errors are surfaced directly so the host app can decide what to do — we do
+     * not re-prompt the user by opening the carrier app behind their back.
+     */
+    private fun mapProviderError(error: Exception, authzData: SimBasedAuthzData): SaaResult {
+        return when (error) {
+            is GetCredentialUnsupportedException ->
+                buildDeepLinkResult(
+                    authzData,
+                    fallbackErrorMessage = error.message ?: "Native TS.43 path is unsupported on this device"
+                )
+            is GetCredentialCancellationException ->
+                SaaResult.Error(SaaErrorCode.CANCELLED, error.message ?: "Cancelled")
+            else ->
+                SaaResult.Error(SaaErrorCode.UNKNOWN, error.message ?: error.javaClass.simpleName)
         }
-        val code = when (error) {
-            is androidx.credentials.exceptions.GetCredentialUnsupportedException ->
-                SaaErrorCode.UNSUPPORTED_NETWORK
-            is androidx.credentials.exceptions.GetCredentialCancellationException ->
-                SaaErrorCode.CANCELLED
-            else -> SaaErrorCode.UNKNOWN
+    }
+
+    /**
+     * Builds either a [SaaResult.DeepLinkRequired] (when [SimBasedAuthzData.androidAppUrl]
+     * is present) or a [SaaResult.Error] with [SaaErrorCode.UNSUPPORTED_NETWORK] otherwise.
+     *
+     * Always attaches [EXTRA_APP_INFO_JWT] to the intent when [SimBasedAuthzData.appInfoJwt]
+     * is present so both fallback paths stay consistent.
+     */
+    private fun buildDeepLinkResult(
+        authzData: SimBasedAuthzData,
+        fallbackErrorMessage: String
+    ): SaaResult {
+        val appUrl = authzData.androidAppUrl
+        if (appUrl.isNullOrBlank()) {
+            return SaaResult.Error(SaaErrorCode.UNSUPPORTED_NETWORK, fallbackErrorMessage)
         }
-        return SaaResult.Error(code, error.message ?: error.javaClass.simpleName)
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(appUrl)).apply {
+            authzData.appInfoJwt?.let { jwt ->
+                putExtra(EXTRA_APP_INFO_JWT, jwt)
+            }
+        }
+        return SaaResult.DeepLinkRequired(intent)
+    }
+
+    /**
+     * Posts [result] to [callback] on the main thread. If the current thread is
+     * already the main thread we still post to keep ordering deterministic — the
+     * callback always runs *after* the current public-API call returns.
+     */
+    private fun dispatch(callback: (SaaResult) -> Unit, result: SaaResult) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            // We're already on the main thread. Invoke directly to avoid forcing
+            // an unconditional async hop, which would surprise simple test setups
+            // and synchronous-feeling early-return paths.
+            callback(result)
+        } else {
+            mainHandler.post { callback(result) }
+        }
     }
 
     companion object {

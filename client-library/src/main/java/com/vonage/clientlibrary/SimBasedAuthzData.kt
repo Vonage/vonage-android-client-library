@@ -133,16 +133,28 @@ data class SimBasedAuthzData(
          *
          * @throws IllegalArgumentException if the `vpResponse` field is missing or malformed.
          */
-        @ExperimentalSaaApi
         fun fromJson(json: JSONObject): SimBasedAuthzData {
             val vpResponseJson = json.optJSONObject("vpResponse")
                 ?: throw IllegalArgumentException("Missing required field: vpResponse")
             return SimBasedAuthzData(
                 vpResponse = VpResponse.fromJson(vpResponseJson),
-                androidAppUrl = json.optString("androidAppUrl").takeIf { it.isNotEmpty() },
-                appInfoJwt = json.optString("appInfoJwt").takeIf { it.isNotEmpty() },
-                iOSAppClipUrl = json.optString("iOSAppClipUrl").takeIf { it.isNotEmpty() }
+                androidAppUrl = json.optStringOrNull("androidAppUrl"),
+                appInfoJwt = json.optStringOrNull("appInfoJwt"),
+                iOSAppClipUrl = json.optStringOrNull("iOSAppClipUrl")
             )
         }
     }
+}
+
+/**
+ * Returns the string value for [key], or null if the key is absent, JSON null,
+ * or an empty string.
+ *
+ * `JSONObject.optString` returns the literal string "null" when the underlying
+ * value is JSON null — this helper guards against that.
+ */
+internal fun JSONObject.optStringOrNull(key: String): String? {
+    if (!has(key) || isNull(key)) return null
+    val value = optString(key)
+    return value.takeIf { it.isNotEmpty() }
 }

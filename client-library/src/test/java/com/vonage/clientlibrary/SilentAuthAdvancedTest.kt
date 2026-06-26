@@ -113,6 +113,56 @@ class SimBasedAuthzDataTest {
     }
 
     @Test
+    fun `fromJson treats JSON null values for optional string fields as null`() {
+        // Issue 1: JSONObject.optString returns the literal string "null" for JSON null;
+        // optStringOrNull must guard against that.
+        val withJsonNulls = """
+            {
+              "vpResponse": {
+                "id": "gnp",
+                "format": "dc-authorization+sd-jwt",
+                "meta": {
+                  "vct_values": [],
+                  "credential_authorization_jwt": "aaa.bbb.ccc"
+                },
+                "claims": []
+              },
+              "androidAppUrl": null,
+              "appInfoJwt": null,
+              "iOSAppClipUrl": null
+            }
+        """.trimIndent()
+        val data = SimBasedAuthzData.fromJson(JSONObject(withJsonNulls))
+        assertNull(data.androidAppUrl)
+        assertNull(data.appInfoJwt)
+        assertNull(data.iOSAppClipUrl)
+    }
+
+    @Test
+    fun `fromJson treats empty string values for optional string fields as null`() {
+        val withEmptyStrings = """
+            {
+              "vpResponse": {
+                "id": "gnp",
+                "format": "dc-authorization+sd-jwt",
+                "meta": {
+                  "vct_values": [],
+                  "credential_authorization_jwt": "aaa.bbb.ccc"
+                },
+                "claims": []
+              },
+              "androidAppUrl": "",
+              "appInfoJwt": "",
+              "iOSAppClipUrl": ""
+            }
+        """.trimIndent()
+        val data = SimBasedAuthzData.fromJson(JSONObject(withEmptyStrings))
+        assertNull(data.androidAppUrl)
+        assertNull(data.appInfoJwt)
+        assertNull(data.iOSAppClipUrl)
+    }
+
+    @Test
     fun `fromJson throws IllegalArgumentException when vpResponse is missing`() {
         assertThrows(IllegalArgumentException::class.java) {
             SimBasedAuthzData.fromJson(JSONObject("{}"))
@@ -383,5 +433,89 @@ class SilentAuthAdvancedManagerTest {
 
         val error = result as SaaResult.Error
         assertEquals(SaaErrorCode.TOKEN_TOO_LARGE, error.code)
+    }
+
+    // ------------------------------------------------------------------
+    // Provider-error mapping
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `provider GetCredentialUnsupportedException falls back to DeepLinkRequired when androidAppUrl present`() {
+        every { mockProvider.isNativePathAvailable(any()) } returns true
+        every { mockProvider.requestToken(any(), any(), any()) } answers {
+            val cb = thirdArg<(String?, Exception?) -> Unit>()
+            cb(null, androidx.credentials.exceptions.GetCredentialUnsupportedException("unsupported"))
+        }
+
+        val manager = SilentAuthAdvancedManager(mockProvider)
+        var result: SaaResult? = null
+        manager.requestOperatorToken(
+            mockActivity,
+            makeAuthzData(
+                androidAppUrl = "https://carrier.example.com/app",
+                appInfoJwt = "my-app-jwt"
+            )
+        ) { result = it }
+
+        val deepLink = result as SaaResult.DeepLinkRequired
+        assertEquals("https://carrier.example.com/app", deepLink.intent.data?.toString())
+        // Issue 3: appInfoJwt extra must also be set on the error-fallback deep-link path
+        assertEquals("my-app-jwt", deepLink.intent.getStringExtra(SilentAuthAdvancedManager.EXTRA_APP_INFO_JWT))
+    }
+
+    @Test
+    fun `provider GetCredentialUnsupportedException returns UNSUPPORTED_NETWORK when no androidAppUrl`() {
+        every { mockProvider.isNativePathAvailable(any()) } returns true
+        every { mockProvider.requestToken(any(), any(), any()) } answers {
+            val cb = thirdArg<(String?, Exception?) -> Unit>()
+            cb(null, androidx.credentials.exceptions.GetCredentialUnsupportedException("unsupported"))
+        }
+
+        val manager = SilentAuthAdvancedManager(mockProvider)
+        var result: SaaResult? = null
+        manager.requestOperatorToken(mockActivity, makeAuthzData()) { result = it }
+
+        val error = result as SaaResult.Error
+        assertEquals(SaaErrorCode.UNSUPPORTED_NETWORK, error.code)
+    }
+
+    @Test
+    fun `provider GetCredentialCancellationException surfaces CANCELLED even when androidAppUrl present`() {
+        // Issue 2: cancellation must NOT re-launch the carrier app behind the user's back
+        every { mockProvider.isNativePathAvailable(any()) } returns true
+        every { mockProvider.requestToken(any(), any(), any()) } answers {
+            val cb = thirdArg<(String?, Exception?) -> Unit>()
+            cb(null, androidx.credentials.exceptions.GetCredentialCancellationException("user cancelled"))
+        }
+
+        val manager = SilentAuthAdvancedManager(mockProvider)
+        var result: SaaResult? = null
+        manager.requestOperatorToken(
+            mockActivity,
+            makeAuthzData(androidAppUrl = "https://carrier.example.com/app")
+        ) { result = it }
+
+        val error = result as SaaResult.Error
+        assertEquals(SaaErrorCode.CANCELLED, error.code)
+    }
+
+    @Test
+    fun `provider generic exception surfaces UNKNOWN even when androidAppUrl present`() {
+        // Issue 2: unrelated errors must NOT re-route to deep-link
+        every { mockProvider.isNativePathAvailable(any()) } returns true
+        every { mockProvider.requestToken(any(), any(), any()) } answers {
+            val cb = thirdArg<(String?, Exception?) -> Unit>()
+            cb(null, RuntimeException("network blew up"))
+        }
+
+        val manager = SilentAuthAdvancedManager(mockProvider)
+        var result: SaaResult? = null
+        manager.requestOperatorToken(
+            mockActivity,
+            makeAuthzData(androidAppUrl = "https://carrier.example.com/app")
+        ) { result = it }
+
+        val error = result as SaaResult.Error
+        assertEquals(SaaErrorCode.UNKNOWN, error.code)
     }
 }
