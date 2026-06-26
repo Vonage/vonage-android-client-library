@@ -1,6 +1,7 @@
 package com.vonage.clientlibrary
 
 import android.content.Context
+import com.vonage.clientlibrary.network.NetworkManager
 import io.mockk.*
 import org.junit.After
 import org.junit.Assert.*
@@ -24,6 +25,20 @@ class VGCellularRequestClientTest {
         val ctxField = VGCellularRequestClient::class.java.getDeclaredField("currentContext")
         ctxField.isAccessible = true
         ctxField.set(null, null)
+    }
+
+    /** Injects a mock NetworkManager into the singleton instance via reflection. */
+    private fun injectMockNetworkManager(client: VGCellularRequestClient, mock: NetworkManager) {
+        val field = VGCellularRequestClient::class.java.getDeclaredField("networkManager")
+        field.isAccessible = true
+        field.set(client, mock)
+    }
+
+    private fun buildClient(): VGCellularRequestClient {
+        val appContext = mockk<Context>(relaxed = true)
+        every { appContext.applicationContext } returns appContext
+        VGCellularRequestClient.initializeSdk(appContext)
+        return VGCellularRequestClient.getInstance()
     }
 
     @Test
@@ -73,5 +88,51 @@ class VGCellularRequestClientTest {
         assertThrows(MalformedURLException::class.java) {
             client.startCellularGetRequest(params, false)
         }
+    }
+
+    // ------------------------------------------------------------------
+    // DEVX-11183: getCellularStatus()
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `getCellularStatus returns Available when NetworkManager returns Available`() {
+        val client = buildClient()
+        val mockNm = mockk<NetworkManager>(relaxed = true)
+        every { mockNm.getCellularStatus() } returns CellularStatus.Available
+        injectMockNetworkManager(client, mockNm)
+
+        assertEquals(CellularStatus.Available, client.getCellularStatus())
+    }
+
+    @Test
+    fun `getCellularStatus returns AvailableNotActive when NetworkManager returns AvailableNotActive`() {
+        val client = buildClient()
+        val mockNm = mockk<NetworkManager>(relaxed = true)
+        every { mockNm.getCellularStatus() } returns CellularStatus.AvailableNotActive
+        injectMockNetworkManager(client, mockNm)
+
+        assertEquals(CellularStatus.AvailableNotActive, client.getCellularStatus())
+    }
+
+    @Test
+    fun `getCellularStatus returns Unavailable when NetworkManager returns Unavailable`() {
+        val client = buildClient()
+        val mockNm = mockk<NetworkManager>(relaxed = true)
+        every { mockNm.getCellularStatus() } returns CellularStatus.Unavailable
+        injectMockNetworkManager(client, mockNm)
+
+        assertEquals(CellularStatus.Unavailable, client.getCellularStatus())
+    }
+
+    @Test
+    fun `getCellularStatus delegates to NetworkManager exactly once`() {
+        val client = buildClient()
+        val mockNm = mockk<NetworkManager>(relaxed = true)
+        every { mockNm.getCellularStatus() } returns CellularStatus.Available
+        injectMockNetworkManager(client, mockNm)
+
+        client.getCellularStatus()
+
+        verify(exactly = 1) { mockNm.getCellularStatus() }
     }
 }
