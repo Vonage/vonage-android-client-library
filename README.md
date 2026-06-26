@@ -10,7 +10,7 @@ A library to support using the Vonage APIs on Android. Features:
 build.gradle -> dependencies add
 
 ```
-implementation 'com.vonage:client-library:1.1.0'
+implementation 'com.vonage:client-library:1.2.0'
 ```
 
 ## Usage
