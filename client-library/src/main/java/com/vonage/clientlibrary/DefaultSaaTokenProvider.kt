@@ -60,8 +60,8 @@ internal class DefaultSaaTokenProvider : SaaTokenProvider {
                         val credentialJson = result.credential.data.getString("credentialJson")
                         if (credentialJson != null) {
                             try {
-                                val token = JSONObject(credentialJson).optString("token")
-                                if (token.isNotEmpty()) {
+                                val token = JSONObject(credentialJson).optStringOrNull("token")
+                                if (!token.isNullOrEmpty()) {
                                     callback(token, null)
                                 } else {
                                     callback(null, IllegalStateException("Token not found in credential response"))
