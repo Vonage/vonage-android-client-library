@@ -74,6 +74,12 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
                     val json = JSONObject()
                     json.put("device_info", deviceInfo())
                     json.put("url_trace", tracer.getTrace().trace)
+                    val tracking = cs.lastOperatorTrackingHeaders
+                    if (tracking.isNotEmpty()) {
+                        val trackingJson = JSONObject()
+                        tracking.forEach { (k, v) -> trackingJson.put(k, v) }
+                        json.put("operator_tracking", trackingJson)
+                    }
                     response.put("debug", json)
                     tracer.stopTrace()
                 }

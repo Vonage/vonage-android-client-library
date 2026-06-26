@@ -419,4 +419,86 @@ class ClientSocketTest {
         val sentRequests = outputStream.toString(Charsets.UTF_8)
         assertFalse("Cookie for wrong domain should not be sent", sentRequests.contains("Cookie: session=nope"))
     }
+
+    // ------------------------------------------------------------------
+    // DEVX-10955: Operator tracking headers
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `open captures Orange trace ID header`() {
+        stubResponse(httpResponse(200,
+            headers = "X-Orange-Trace-Id: orange-abc-123\r\n",
+            body = """{"ok":true}"""
+        ))
+
+        val cs = ClientSocket(mockTracer)
+        cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("orange-abc-123", cs.lastOperatorTrackingHeaders["X-Orange-Trace-Id"])
+    }
+
+    @Test
+    fun `open captures Vodafone trace ID header`() {
+        stubResponse(httpResponse(200,
+            headers = "X-VIG-Trace-Id: vodafone-xyz-789\r\n",
+            body = """{"ok":true}"""
+        ))
+
+        val cs = ClientSocket(mockTracer)
+        cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("vodafone-xyz-789", cs.lastOperatorTrackingHeaders["X-VIG-Trace-Id"])
+    }
+
+    @Test
+    fun `open captures multiple operator tracking headers`() {
+        stubResponse(httpResponse(200,
+            headers = "X-Orange-Trace-Id: orange-111\r\nX-VIG-Trace-Id: voda-222\r\n",
+            body = """{"ok":true}"""
+        ))
+
+        val cs = ClientSocket(mockTracer)
+        cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("orange-111", cs.lastOperatorTrackingHeaders["X-Orange-Trace-Id"])
+        assertEquals("voda-222", cs.lastOperatorTrackingHeaders["X-VIG-Trace-Id"])
+    }
+
+    @Test
+    fun `open ignores non-tracking headers and does not include them in tracking map`() {
+        stubResponse(httpResponse(200,
+            headers = "X-Custom-Header: should-be-ignored\r\n",
+            body = """{"ok":true}"""
+        ))
+
+        val cs = ClientSocket(mockTracer)
+        cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse(cs.lastOperatorTrackingHeaders.containsKey("X-Custom-Header"))
+    }
+
+    @Test
+    fun `lastOperatorTrackingHeaders is empty when no tracking headers present`() {
+        stubResponse(httpResponse(200, body = """{"ok":true}"""))
+
+        val cs = ClientSocket(mockTracer)
+        cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertTrue(cs.lastOperatorTrackingHeaders.isEmpty())
+    }
+
+    @Test
+    fun `operator tracking header matching is case-insensitive`() {
+        stubResponse(httpResponse(200,
+            headers = "x-orange-trace-id: lower-case-value\r\n",
+            body = """{"ok":true}"""
+        ))
+
+        val cs = ClientSocket(mockTracer)
+        cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        // The key is stored as it appears in the response, value should be captured
+        val keys = cs.lastOperatorTrackingHeaders.keys.map { it.lowercase() }
+        assertTrue(keys.contains("x-orange-trace-id"))
+    }
 }

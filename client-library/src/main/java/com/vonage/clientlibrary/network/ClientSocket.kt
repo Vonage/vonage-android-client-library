@@ -24,6 +24,9 @@ internal class ClientSocket constructor(
     private lateinit var output: OutputStream
     private lateinit var rawInput: InputStream  // kept raw for byte-accurate Content-Length reads
 
+    var lastOperatorTrackingHeaders: Map<String, String> = emptyMap()
+        private set
+
     fun open(
         url: URL,
         headers: Map<String, String>?,
@@ -396,6 +399,7 @@ internal class ClientSocket constructor(
         val bodyBuilder = StringBuilder()  // DEVX-11223: avoid O(n²) string concat
         val cookies: ArrayList<HttpCookie> = ArrayList()
         if (existingCookies != null) cookies.addAll(existingCookies)
+        val trackingHeaders: MutableMap<String, String> = mutableMapOf()
 
         try {
             // DEVX-11221: Parse headers line-by-line instead of buffering the full response.
@@ -447,6 +451,16 @@ internal class ClientSocket constructor(
                             if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Content-Length - $contentLength")
                         }
                     }
+                    OPERATOR_TRACKING_HEADERS.any { line!!.startsWith(it, ignoreCase = true) } -> {
+                        val currentLine = line!!
+                        val colonIdx = currentLine.indexOf(':')
+                        if (colonIdx > 0) {
+                            val name = currentLine.substring(0, colonIdx).trim()
+                            val value = currentLine.substring(colonIdx + 1).trim()
+                            trackingHeaders[name] = value
+                            tracer.addDebug(Log.DEBUG, TAG, "Operator tracking header: $name=$value")
+                        }
+                    }
                     (type == "application/json" || type == "application/hal+json" || type == "application/problem+json") && line.isEmpty() -> {
                         bodyBegin = true
                     }
@@ -493,10 +507,11 @@ internal class ClientSocket constructor(
             val body: String? = if (bodyBegin && bodyBuilder.isNotEmpty()) bodyBuilder.toString() else null
             if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Status - $status\nBody - $body\n")
             tracer.addTrace("Status - $status ${DateUtils.now()}\nBody - $body\n")
+            lastOperatorTrackingHeaders = trackingHeaders
             return redirectResult ?: if (bodyBegin && body != null) {
-                ResultHandler(status, null, parseBodyIntoJSONString(body), cookies)
+                ResultHandler(status, null, parseBodyIntoJSONString(body), cookies, operatorTrackingHeaders = trackingHeaders)
             } else {
-                ResultHandler(status, null, null, null)
+                ResultHandler(status, null, null, null, operatorTrackingHeaders = trackingHeaders)
             }
         } catch (ex: Exception) {
             tracer.addDebug(Log.ERROR, TAG, "Client reading exception : ${ex.message}")
@@ -612,6 +627,13 @@ internal class ClientSocket constructor(
         private const val PORT_443 = 443
         private const val CRLF = "\r\n"
         private const val GLOBAL_DEADLINE_MS: Long = 30_000
+
+        // Operator-injected tracking headers to capture and log for troubleshooting.
+        // Orange uses X-Orange-Trace-Id; Vodafone uses X-VIG-Trace-Id.
+        internal val OPERATOR_TRACKING_HEADERS = listOf(
+            "X-Orange-Trace-Id",
+            "X-VIG-Trace-Id"
+        )
     }
 
     class ResultHandler(
@@ -619,7 +641,8 @@ internal class ClientSocket constructor(
         redirect: URL?,
         body: String?,
         cookies: ArrayList<HttpCookie>?,
-        val mustCloseConnection: Boolean = false
+        val mustCloseConnection: Boolean = false,
+        val operatorTrackingHeaders: Map<String, String> = emptyMap()
     ) : ResultResponse {
         val s: Int = httpStatus
         val r: URL? = redirect
@@ -643,7 +666,7 @@ internal class ClientSocket constructor(
         }
 
         fun withMustClose(): ResultHandler =
-            ResultHandler(s, r, b, cs, mustCloseConnection = true)
+            ResultHandler(s, r, b, cs, mustCloseConnection = true, operatorTrackingHeaders)
     }
 
     class ResponseHandler(httpStatus: Int, body: String?) : ResultResponse {
