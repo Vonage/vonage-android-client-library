@@ -1,5 +1,6 @@
 package com.vonage.clientlibrary
 
+import android.app.Activity
 import android.content.Context
 import com.vonage.clientlibrary.network.NetworkManager
 import io.mockk.*
@@ -134,5 +135,72 @@ class VGCellularRequestClientTest {
         client.getCellularStatus()
 
         verify(exactly = 1) { mockNm.getCellularStatus() }
+    }
+
+    // ------------------------------------------------------------------
+    // SAA: requestSilentAuthAdvancedToken()
+    // ------------------------------------------------------------------
+
+    @OptIn(ExperimentalSaaApi::class)
+    @Test
+    fun `requestSilentAuthAdvancedToken delegates to SilentAuthAdvancedManager`() {
+        val client = buildClient()
+        val mockActivity = mockk<Activity>(relaxed = true)
+        val mockManager = mockk<SilentAuthAdvancedManager>(relaxed = true)
+
+        val authzData = SimBasedAuthzData(
+            vpResponse = VpResponse(
+                id = "gnp",
+                format = "dc-authorization+sd-jwt",
+                meta = VpMeta(
+                    vctValues = listOf("number-verification/device-phone-number/ts43"),
+                    credentialAuthorizationJwt = "aaa.bbb.ccc"
+                ),
+                claims = emptyList()
+            ),
+            androidAppUrl = null,
+            appInfoJwt = null
+        )
+
+        val slot = slot<(SaaResult) -> Unit>()
+        every { mockManager.requestOperatorToken(any(), any(), capture(slot)) } answers {
+            slot.captured(SaaResult.Success("test-token"))
+        }
+
+        var result: SaaResult? = null
+        client.requestSilentAuthAdvancedToken(mockActivity, authzData, mockManager) { result = it }
+
+        verify(exactly = 1) { mockManager.requestOperatorToken(mockActivity, authzData, any()) }
+        assertEquals(SaaResult.Success("test-token"), result)
+    }
+
+    @OptIn(ExperimentalSaaApi::class)
+    @Test
+    fun `requestSilentAuthAdvancedToken passes error result through`() {
+        val client = buildClient()
+        val mockActivity = mockk<Activity>(relaxed = true)
+        val mockManager = mockk<SilentAuthAdvancedManager>(relaxed = true)
+
+        val authzData = SimBasedAuthzData(
+            vpResponse = VpResponse(
+                id = "gnp",
+                format = "dc-authorization+sd-jwt",
+                meta = VpMeta(vctValues = emptyList(), credentialAuthorizationJwt = "jwt"),
+                claims = emptyList()
+            ),
+            androidAppUrl = null,
+            appInfoJwt = null
+        )
+
+        val slot = slot<(SaaResult) -> Unit>()
+        every { mockManager.requestOperatorToken(any(), any(), capture(slot)) } answers {
+            slot.captured(SaaResult.Error(SaaErrorCode.UNSUPPORTED_NETWORK, "no carrier support"))
+        }
+
+        var result: SaaResult? = null
+        client.requestSilentAuthAdvancedToken(mockActivity, authzData, mockManager) { result = it }
+
+        val error = result as SaaResult.Error
+        assertEquals(SaaErrorCode.UNSUPPORTED_NETWORK, error.code)
     }
 }
