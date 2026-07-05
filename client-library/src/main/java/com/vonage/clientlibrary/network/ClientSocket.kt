@@ -24,6 +24,8 @@ internal class ClientSocket constructor(
     private lateinit var output: OutputStream
     private lateinit var rawInput: InputStream  // kept raw for byte-accurate Content-Length reads
 
+    private val httpLogger = HttpRequestLogger(isDebuggable)
+
     var lastOperatorTrackingHeaders: Map<String, String> = emptyMap()
         private set
 
@@ -39,6 +41,9 @@ internal class ClientSocket constructor(
         var redirectCount = 0
         var result: ResultHandler? = null
         var connectedAuthority: String? = null  // "host:port" — guards against same-host/different-port reuse
+
+        httpLogger.logRequest("GET", url.toString(), headers, body = null)
+
         do {
             redirectCount += 1
             val nurl = redirectURL ?: url
@@ -93,6 +98,7 @@ internal class ClientSocket constructor(
                 }
             } catch (ex: Exception) {
                 tracer.addDebug(Log.DEBUG, TAG, "Cannot start connection: $nurl")
+                httpLogger.logError("Connection failed to $nurl", ex)
                 if (connectedAuthority != null) {
                     runCatching { stopConnection() }
                     connectedAuthority = null
@@ -212,6 +218,7 @@ internal class ClientSocket constructor(
                 }
                 if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Status - $status [$chunked]\nBody - $body\n")
                 result = ResponseHandler(status, body)
+                httpLogger.logResponse(status, null, body)
             }
         } catch (ex: Exception) {
             tracer.addDebug(Log.ERROR, TAG, "Client reading exception : ${ex.message}")
@@ -221,9 +228,12 @@ internal class ClientSocket constructor(
     }
 
     fun post(url: URL, headers: Map<String, String>, body: String?): JSONObject {
+        httpLogger.logRequest("POST", url.toString(), headers, body)
+
         try {
             startConnection(url)
             val request = makePost(url, headers, body)
+            httpLogger.logRawRequest(request)
             val response = sendAndReceive(request)
             if (response != null) {
                 return convertResultHandler(response)
@@ -231,6 +241,7 @@ internal class ClientSocket constructor(
             return convertError("sdk_error", "internal error")
         } catch (ex: Exception) {
             tracer.addDebug(Log.DEBUG, TAG, "Cannot complete post: $url")
+            httpLogger.logError("POST request failed to $url", ex)
             return convertError("sdk_connection_error", "Connection failed: ${ex.localizedMessage ?: ex}")
         } finally {
             if (this::socket.isInitialized) {
@@ -323,6 +334,7 @@ internal class ClientSocket constructor(
         keepAlive: Boolean = false
     ): ResultHandler? {
         val command = makeHTTPCommand(url, headers, operator, cookies, requestId, keepAlive)
+        httpLogger.logRawRequest(command)
         return sendAndReceive(url, command, cookies)
     }
 
@@ -332,6 +344,9 @@ internal class ClientSocket constructor(
         }
         var port = PORT_443
         if (url.port > 0) port = url.port
+
+        httpLogger.logConnection("Opening", url.host, port)
+
         tracer.addDebug(Log.DEBUG, TAG, "start : ${url.host} ${url.port} ${url.protocol}")
         tracer.addTrace("\nStart connection ${url.host} ${url.port} ${url.protocol} ${DateUtils.now()}\n")
         val sslSocket = SSLSocketFactory.getDefault().createSocket(url.host, port) as SSLSocket
@@ -500,6 +515,7 @@ internal class ClientSocket constructor(
 
             if (earlyRedirect) {
                 tracer.addTrace("Returning redirect - ${DateUtils.now()}\n")
+                httpLogger.logRedirect(requestURL.toString(), redirectResult?.getRedirect()?.toString() ?: "unknown", status)
                 // Signal open() to close the connection if we couldn't drain
                 return if (mustClose) redirectResult?.withMustClose() else redirectResult
             }
@@ -507,6 +523,7 @@ internal class ClientSocket constructor(
             val body: String? = if (bodyBegin && bodyBuilder.isNotEmpty()) bodyBuilder.toString() else null
             if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Status - $status\nBody - $body\n")
             tracer.addTrace("Status - $status ${DateUtils.now()}\nBody - $body\n")
+            httpLogger.logResponse(status, trackingHeaders.ifEmpty { null }, body)
             lastOperatorTrackingHeaders = trackingHeaders
             return redirectResult ?: if (bodyBegin && body != null) {
                 ResultHandler(status, null, parseBodyIntoJSONString(body), cookies, operatorTrackingHeaders = trackingHeaders)
@@ -582,6 +599,7 @@ internal class ClientSocket constructor(
     }
 
     private fun stopConnection() {
+        httpLogger.logConnection("Closing", socket.inetAddress.hostAddress ?: "unknown", socket.port)
         tracer.addDebug(Log.DEBUG, TAG, "closed the connection ${socket.inetAddress.hostAddress}")
         try {
             rawInput.close()
