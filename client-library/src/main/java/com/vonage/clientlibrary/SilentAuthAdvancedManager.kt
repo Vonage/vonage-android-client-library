@@ -2,9 +2,11 @@ package com.vonage.clientlibrary
 
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import androidx.annotation.MainThread
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.GetCredentialUnsupportedException
@@ -51,6 +53,23 @@ class SilentAuthAdvancedManager(
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    /** Whether debug logging is active. Set lazily on first use from the Activity context. */
+    private var isDebuggable: Boolean? = null
+
+    private fun debugLog(msg: String) {
+        if (isDebuggable == true) Log.d(TAG, msg)
+    }
+
+    private fun errorLog(msg: String) {
+        if (isDebuggable == true) Log.e(TAG, msg)
+    }
+
+    private fun initDebuggable(activity: Activity) {
+        if (isDebuggable == null) {
+            isDebuggable = (activity.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        }
+    }
+
     /**
      * Requests an operator token for the given [SimBasedAuthzData].
      *
@@ -72,9 +91,21 @@ class SilentAuthAdvancedManager(
         authzData: SimBasedAuthzData,
         callback: (SaaResult) -> Unit
     ) {
+        initDebuggable(activity)
+        debugLog("┌────── SAA: requestOperatorToken ──────────────────────────")
+        debugLog("│ vpResponse.id: ${authzData.vpResponse.id}")
+        debugLog("│ vpResponse.format: ${authzData.vpResponse.format}")
+        debugLog("│ vpResponse.meta.vctValues: ${authzData.vpResponse.meta.vctValues}")
+        debugLog("│ vpResponse.meta.credentialAuthorizationJwt: ${authzData.vpResponse.meta.credentialAuthorizationJwt.take(50)}...")
+        debugLog("│ vpResponse.claims: ${authzData.vpResponse.claims}")
+        debugLog("│ androidAppUrl: ${authzData.androidAppUrl}")
+        debugLog("│ appInfoJwt present: ${authzData.appInfoJwt != null}")
+        debugLog("└────────────────────────────────────────────────────────────")
+
         // Validate the payload before attempting anything
         val jwt = authzData.vpResponse.meta.credentialAuthorizationJwt
         if (jwt.isBlank()) {
+            errorLog("credential_authorization_jwt is missing or empty")
             dispatch(callback, SaaResult.Error(
                 SaaErrorCode.MALFORMED_PAYLOAD,
                 "credential_authorization_jwt is missing or empty"
@@ -90,30 +121,44 @@ class SilentAuthAdvancedManager(
             ?.firstOrNull()
 
         if (phoneHint != null && phoneHint.startsWith("+990")) {
+            debugLog("Virtual operator detected: $phoneHint")
             handleVirtualOperator(phoneHint, callback)
             return
         }
 
         // Attempt native TS.43 path
-        if (tokenProvider.isNativePathAvailable(activity)) {
+        val nativeAvailable = tokenProvider.isNativePathAvailable(activity)
+        debugLog("Native TS.43 path available: $nativeAvailable")
+        if (nativeAvailable) {
+            debugLog("Requesting token via native CredentialManager...")
             tokenProvider.requestToken(activity, jwt) { token, error ->
                 when {
                     token != null -> {
+                        debugLog("Token received (${token.toByteArray(Charsets.UTF_8).size} bytes)")
                         if (token.toByteArray(Charsets.UTF_8).size > MAX_TOKEN_BYTES) {
+                            errorLog("Token exceeds 5 KB limit")
                             dispatch(callback, SaaResult.Error(
                                 SaaErrorCode.TOKEN_TOO_LARGE,
                                 "Operator token exceeds the 5 KB size limit"
                             ))
                         } else {
+                            debugLog("SAA completed successfully")
                             dispatch(callback, SaaResult.Success(token))
                         }
                     }
-                    error != null -> dispatch(callback, mapProviderError(error, authzData))
-                    else -> dispatch(callback, SaaResult.Error(SaaErrorCode.UNKNOWN, "No token and no error returned"))
+                    error != null -> {
+                        errorLog("Token provider error: ${error.javaClass.simpleName}: ${error.message}")
+                        dispatch(callback, mapProviderError(error, authzData))
+                    }
+                    else -> {
+                        errorLog("Token provider returned null token and null error")
+                        dispatch(callback, SaaResult.Error(SaaErrorCode.UNKNOWN, "No token and no error returned"))
+                    }
                 }
             }
         } else {
             // Native path unavailable — try deep-link fallback
+            debugLog("Falling back to deep-link path")
             val deepLinkResult = buildDeepLinkResult(
                 authzData,
                 fallbackErrorMessage = "Native TS.43 path is unavailable and no androidAppUrl fallback is provided"
@@ -228,6 +273,8 @@ class SilentAuthAdvancedManager(
     }
 
     companion object {
+        private const val TAG = "VonageSAA"
+
         /** Maximum permitted operator token size in bytes (5 KB). */
         const val MAX_TOKEN_BYTES = 5 * 1024
 

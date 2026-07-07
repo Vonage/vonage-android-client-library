@@ -1,7 +1,9 @@
 package com.vonage.clientlibrary
 
 import android.app.Activity
+import android.content.pm.ApplicationInfo
 import android.os.CancellationSignal
+import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.credentials.CredentialManager
 import androidx.credentials.CredentialManagerCallback
@@ -24,11 +26,18 @@ import org.json.JSONObject
 @OptIn(androidx.credentials.ExperimentalDigitalCredentialApi::class)
 internal class DefaultSaaTokenProvider : SaaTokenProvider {
 
+    private fun isDebuggable(activity: Activity): Boolean =
+        (activity.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
     override fun isNativePathAvailable(activity: Activity): Boolean {
         // The DigitalCredential API requires Android 14 (API 34) and a carrier
         // that has provisioned a TS.43 applet on the SIM. We can only determine
         // full availability at request time; this is a best-effort OS version check.
-        return android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+        val available = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+        if (isDebuggable(activity)) {
+            Log.d(TAG, "isNativePathAvailable: $available (SDK_INT=${android.os.Build.VERSION.SDK_INT}, required>=34)")
+        }
+        return available
     }
 
     @OptIn(ExperimentalSaaApi::class)
@@ -37,11 +46,18 @@ internal class DefaultSaaTokenProvider : SaaTokenProvider {
         credentialAuthorizationJwt: String,
         callback: (token: String?, error: Exception?) -> Unit
     ) {
+        val debug = isDebuggable(activity)
         try {
             // Build the DigitalCredential request JSON as required by the TS.43 spec.
             val requestJson = JSONObject()
                 .put("credential_authorization_jwt", credentialAuthorizationJwt)
                 .toString()
+
+            if (debug) {
+                Log.d(TAG, "┌────── CredentialManager Request ──────────────────────")
+                Log.d(TAG, "│ requestJson: $requestJson")
+                Log.d(TAG, "└──────────────────────────────────────────────────────")
+            }
 
             val option = GetDigitalCredentialOption(requestJson)
             val request = GetCredentialRequest.Builder()
@@ -50,6 +66,8 @@ internal class DefaultSaaTokenProvider : SaaTokenProvider {
 
             val credentialManager = CredentialManager.create(activity)
 
+            if (debug) Log.d(TAG, "Calling credentialManager.getCredentialAsync...")
+
             credentialManager.getCredentialAsync(
                 context = activity,
                 request = request,
@@ -57,30 +75,62 @@ internal class DefaultSaaTokenProvider : SaaTokenProvider {
                 executor = ContextCompat.getMainExecutor(activity),
                 callback = object : CredentialManagerCallback<GetCredentialResponse, GetCredentialException> {
                     override fun onResult(result: GetCredentialResponse) {
+                        if (debug) {
+                            Log.d(TAG, "┌────── CredentialManager Response ─────────────────────")
+                            Log.d(TAG, "│ credential.type: ${result.credential.type}")
+                            Log.d(TAG, "│ credential.data keys: ${result.credential.data.keySet()}")
+                        }
                         val credentialJson = result.credential.data.getString("credentialJson")
+                        if (debug) Log.d(TAG, "│ credentialJson: $credentialJson")
                         if (credentialJson != null) {
                             try {
                                 val token = JSONObject(credentialJson).optStringOrNull("token")
                                 if (!token.isNullOrEmpty()) {
+                                    if (debug) {
+                                        Log.d(TAG, "│ token: ${token.take(50)}... (${token.length} chars)")
+                                        Log.d(TAG, "└──────────────────────────────────────────────────────")
+                                    }
                                     callback(token, null)
                                 } else {
+                                    if (debug) {
+                                        Log.e(TAG, "│ ERROR: Token not found in credentialJson")
+                                        Log.e(TAG, "└──────────────────────────────────────────────────────")
+                                    }
                                     callback(null, IllegalStateException("Token not found in credential response"))
                                 }
                             } catch (e: Exception) {
+                                if (debug) {
+                                    Log.e(TAG, "│ ERROR parsing credentialJson: ${e.message}")
+                                    Log.e(TAG, "└──────────────────────────────────────────────────────")
+                                }
                                 callback(null, e)
                             }
                         } else {
+                            if (debug) {
+                                Log.e(TAG, "│ ERROR: credentialJson key not present in response data")
+                                Log.e(TAG, "└──────────────────────────────────────────────────────")
+                            }
                             callback(null, IllegalStateException("credentialJson not present in response"))
                         }
                     }
 
                     override fun onError(e: GetCredentialException) {
+                        if (debug) {
+                            Log.e(TAG, "┌────── CredentialManager Error ────────────────────────")
+                            Log.e(TAG, "│ ${e.javaClass.simpleName}: ${e.message}")
+                            Log.e(TAG, "└──────────────────────────────────────────────────────")
+                        }
                         callback(null, e)
                     }
                 }
             )
         } catch (e: Exception) {
+            if (debug) Log.e(TAG, "requestToken exception: ${e.javaClass.simpleName}: ${e.message}")
             callback(null, e)
         }
+    }
+
+    companion object {
+        private const val TAG = "VonageSAA"
     }
 }
