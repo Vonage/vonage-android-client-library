@@ -2,6 +2,7 @@ package com.vonage.clientlibrary
 
 import android.app.Activity
 import io.mockk.*
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.*
@@ -49,28 +50,28 @@ class SimBasedAuthzDataTest {
     @Test
     fun `fromJson parses vpResponse id and format`() {
         val data = SimBasedAuthzData.fromJson(JSONObject(fullPayloadJson))
-        assertEquals("gnp", data.vpResponse.id)
-        assertEquals("dc-authorization+sd-jwt", data.vpResponse.format)
+        assertEquals("gnp", data.vpResponse!!.id)
+        assertEquals("dc-authorization+sd-jwt", data.vpResponse!!.format)
     }
 
     @Test
     fun `fromJson parses vpResponse meta vct_values`() {
         val data = SimBasedAuthzData.fromJson(JSONObject(fullPayloadJson))
-        assertEquals(listOf("number-verification/device-phone-number/ts43"), data.vpResponse.meta.vctValues)
+        assertEquals(listOf("number-verification/device-phone-number/ts43"), data.vpResponse!!.meta.vctValues)
     }
 
     @Test
     fun `fromJson parses vpResponse meta credential_authorization_jwt`() {
         val data = SimBasedAuthzData.fromJson(JSONObject(fullPayloadJson))
-        assertEquals("aaa.bbb.ccc", data.vpResponse.meta.credentialAuthorizationJwt)
+        assertEquals("aaa.bbb.ccc", data.vpResponse!!.meta.credentialAuthorizationJwt)
     }
 
     @Test
     fun `fromJson parses claims path and values`() {
         val data = SimBasedAuthzData.fromJson(JSONObject(fullPayloadJson))
-        assertEquals(1, data.vpResponse.claims.size)
-        assertEquals(listOf("phone_number_hint"), data.vpResponse.claims[0].path)
-        assertEquals(listOf("+467234524553"), data.vpResponse.claims[0].values)
+        assertEquals(1, data.vpResponse!!.claims.size)
+        assertEquals(listOf("phone_number_hint"), data.vpResponse!!.claims[0].path)
+        assertEquals(listOf("+467234524553"), data.vpResponse!!.claims[0].values)
     }
 
     @Test
@@ -163,10 +164,11 @@ class SimBasedAuthzDataTest {
     }
 
     @Test
-    fun `fromJson throws IllegalArgumentException when vpResponse is missing`() {
-        assertThrows(IllegalArgumentException::class.java) {
-            SimBasedAuthzData.fromJson(JSONObject("{}"))
-        }
+    fun `fromJson sets vpResponse to null when absent`() {
+        // vpResponse is not part of any fixed spec for this payload — its
+        // absence is not treated as malformed input at parse time.
+        val data = SimBasedAuthzData.fromJson(JSONObject("{}"))
+        assertNull(data.vpResponse)
     }
 
     @Test
@@ -188,9 +190,113 @@ class SimBasedAuthzDataTest {
             }
         """.trimIndent()
         val data = SimBasedAuthzData.fromJson(JSONObject(json))
-        assertEquals(2, data.vpResponse.claims.size)
-        assertEquals("country", data.vpResponse.claims[1].path[0])
-        assertEquals("US", data.vpResponse.claims[1].values[0])
+        assertEquals(2, data.vpResponse!!.claims.size)
+        assertEquals("country", data.vpResponse!!.claims[1].path[0])
+        assertEquals("US", data.vpResponse!!.claims[1].values[0])
+    }
+}
+
+@OptIn(ExperimentalSaaApi::class)
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28], manifest = Config.NONE)
+class SaaRequestBuildersTest {
+
+    // ------------------------------------------------------------------
+    // buildDefaultRequestJson — Task 1 refactor, literal output check
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `buildDefaultRequestJson produces literal expected JSON`() {
+        val json = buildDefaultRequestJson("aaa.bbb.ccc")
+        assertEquals(
+            JSONObject(mapOf("credential_authorization_jwt" to "aaa.bbb.ccc")).toString(),
+            json
+        )
+        assertEquals("aaa.bbb.ccc", JSONObject(json).getString("credential_authorization_jwt"))
+    }
+
+    // ------------------------------------------------------------------
+    // buildSignedPassthroughRequestJson
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `buildSignedPassthroughRequestJson wraps jwt under protocol and data-request`() {
+        val json = buildSignedPassthroughRequestJson("aaa.bbb.ccc")
+        val parsed = JSONObject(json)
+
+        assertEquals("openid4vp-v1-signed", parsed.getString("protocol"))
+        assertEquals("aaa.bbb.ccc", parsed.getJSONObject("data").getString("request"))
+    }
+
+    @Test
+    fun `buildSignedPassthroughRequestJson produces literal expected JSON`() {
+        val json = buildSignedPassthroughRequestJson("aaa.bbb.ccc")
+        val expected = JSONObject()
+            .put("protocol", "openid4vp-v1-signed")
+            .put("data", JSONObject().put("request", "aaa.bbb.ccc"))
+            .toString()
+        assertEquals(expected, json)
+    }
+
+    // ------------------------------------------------------------------
+    // buildMergedDcqlRequestJson
+    // ------------------------------------------------------------------
+
+    private fun sampleVpResponse(): VpResponse = VpResponse(
+        id = "gnp",
+        format = "dc-authorization+sd-jwt",
+        meta = VpMeta(
+            vctValues = listOf("number-verification/device-phone-number/ts43"),
+            credentialAuthorizationJwt = "aaa.bbb.ccc"
+        ),
+        claims = listOf(VpClaim(path = listOf("phone_number_hint"), values = listOf("+467234524553")))
+    )
+
+    @Test
+    fun `buildMergedDcqlRequestJson produces literal expected JSON`() {
+        val json = buildMergedDcqlRequestJson(sampleVpResponse(), "aaa.bbb.ccc")
+
+        val credential = JSONObject()
+            .put("id", "gnp")
+            .put("format", "dc-authorization+sd-jwt")
+            .put("meta", JSONObject().put("vct_values", JSONArray(listOf("number-verification/device-phone-number/ts43"))))
+            .put("claims", JSONArray().put(
+                JSONObject()
+                    .put("path", JSONArray(listOf("phone_number_hint")))
+                    .put("values", JSONArray(listOf("+467234524553")))
+            ))
+        val dcqlQuery = JSONObject().put("credentials", JSONArray().put(credential))
+        val expected = JSONObject()
+            .put("protocol", "openid4vp-v1-unsigned")
+            .put("data", JSONObject()
+                .put("response_type", "vp_token")
+                .put("response_mode", "dc_api")
+                .put("dcql_query", dcqlQuery)
+                .put("request", "aaa.bbb.ccc")
+            )
+            .toString()
+
+        assertEquals(expected, json)
+    }
+
+    @Test
+    fun `buildMergedDcqlRequestJson embeds vpResponse fields into dcql_query credentials`() {
+        val json = buildMergedDcqlRequestJson(sampleVpResponse(), "aaa.bbb.ccc")
+        val parsed = JSONObject(json)
+
+        assertEquals("openid4vp-v1-unsigned", parsed.getString("protocol"))
+        val data = parsed.getJSONObject("data")
+        assertEquals("vp_token", data.getString("response_type"))
+        assertEquals("dc_api", data.getString("response_mode"))
+        assertEquals("aaa.bbb.ccc", data.getString("request"))
+
+        val credential = data.getJSONObject("dcql_query").getJSONArray("credentials").getJSONObject(0)
+        assertEquals("gnp", credential.getString("id"))
+        assertEquals("dc-authorization+sd-jwt", credential.getString("format"))
+        assertEquals(
+            "phone_number_hint",
+            credential.getJSONArray("claims").getJSONObject(0).getJSONArray("path").getString(0)
+        )
     }
 }
 
@@ -246,6 +352,21 @@ class SilentAuthAdvancedManagerTest {
     // ------------------------------------------------------------------
     // Malformed payload
     // ------------------------------------------------------------------
+
+    @Test
+    fun `returns MALFORMED_PAYLOAD error when vpResponse is null`() {
+        val manager = SilentAuthAdvancedManager(mockProvider)
+        var result: SaaResult? = null
+        val authzData = SimBasedAuthzData(
+            vpResponse = null,
+            androidAppUrl = null,
+            appInfoJwt = null
+        )
+        manager.requestOperatorToken(mockActivity, authzData) { result = it }
+
+        val error = result as SaaResult.Error
+        assertEquals(SaaErrorCode.MALFORMED_PAYLOAD, error.code)
+    }
 
     @Test
     fun `returns MALFORMED_PAYLOAD error when credential_authorization_jwt is blank`() {

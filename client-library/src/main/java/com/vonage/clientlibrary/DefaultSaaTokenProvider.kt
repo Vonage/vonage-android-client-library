@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.pm.ApplicationInfo
 import android.os.CancellationSignal
 import android.util.Log
+import androidx.annotation.VisibleForTesting
 import androidx.core.content.ContextCompat
 import androidx.credentials.CredentialManager
 import androidx.credentials.CredentialManagerCallback
@@ -13,6 +14,7 @@ import androidx.credentials.GetDigitalCredentialOption
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.GetCredentialException
 import androidx.credentials.exceptions.GetCredentialUnsupportedException
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -49,9 +51,7 @@ internal class DefaultSaaTokenProvider : SaaTokenProvider {
         val debug = isDebuggable(activity)
         try {
             // Build the DigitalCredential request JSON as required by the TS.43 spec.
-            val requestJson = JSONObject()
-                .put("credential_authorization_jwt", credentialAuthorizationJwt)
-                .toString()
+            val requestJson = buildDefaultRequestJson(credentialAuthorizationJwt)
 
             if (debug) {
                 Log.d(TAG, "┌────── CredentialManager Request ──────────────────────")
@@ -133,4 +133,99 @@ internal class DefaultSaaTokenProvider : SaaTokenProvider {
     companion object {
         private const val TAG = "VonageSAA"
     }
+}
+
+/**
+ * Builds the `requestJson` payload passed to [GetDigitalCredentialOption] for
+ * today's default (production) request path.
+ *
+ * This is a pure extraction of the request-construction logic previously
+ * inlined in [DefaultSaaTokenProvider.requestToken] — no behavior change.
+ * It exists to give alternate, experimental builders (see
+ * [buildSignedPassthroughRequestJson], [buildMergedDcqlRequestJson]) a seam
+ * to be substituted in test harnesses without duplicating the rest of
+ * `requestToken`'s logic (native-path check, callback wiring, error mapping,
+ * size check, etc.).
+ *
+ * Not `internal`: exposed (behind [ExperimentalSaaApi] opt-in and
+ * [VisibleForTesting]) so the `clientlibrarytestapp` module's manual test
+ * harness can call it directly. It is not intended for use by SDK
+ * consumers outside of testing/experimentation.
+ */
+@ExperimentalSaaApi
+@VisibleForTesting
+fun buildDefaultRequestJson(credentialAuthorizationJwt: String): String {
+    return JSONObject()
+        .put("credential_authorization_jwt", credentialAuthorizationJwt)
+        .toString()
+}
+
+/**
+ * EXPERIMENTAL / UNVERIFIED. Candidate request shape per OpenID4VP spec
+ * Appendix A.3.2.1 (JWS Compact Serialization for a signed DC API request).
+ * Passes the aggregator-signed JWT through with minimal wrapping, with no
+ * attempt to merge sibling vpResponse fields into the request.
+ *
+ * NOT CONFIRMED TO WORK. This is not wired into [DefaultSaaTokenProvider]'s
+ * production request path — it exists solely so a manual test harness can
+ * try this shape against a real device/carrier and observe the raw OS
+ * response. Do not call this from production code.
+ *
+ * Not `internal`: exposed (behind [ExperimentalSaaApi] opt-in and
+ * [VisibleForTesting]) so the `clientlibrarytestapp` module's manual test
+ * harness can call it directly. It is not intended for use by SDK
+ * consumers outside of testing/experimentation.
+ */
+@ExperimentalSaaApi
+@VisibleForTesting
+fun buildSignedPassthroughRequestJson(credentialAuthorizationJwt: String): String {
+    return JSONObject()
+        .put("protocol", "openid4vp-v1-signed")
+        .put("data", JSONObject().put("request", credentialAuthorizationJwt))
+        .toString()
+}
+
+/**
+ * EXPERIMENTAL / UNVERIFIED. Candidate request shape that merges the
+ * sibling vpResponse fields (format, vct_values, claims) into a dcql_query,
+ * on the hypothesis that the JWT alone is insufficient and the DCQL fields
+ * are required inputs rather than informational duplicates.
+ *
+ * NOT CONFIRMED TO WORK. This is not wired into [DefaultSaaTokenProvider]'s
+ * production request path — it exists solely so a manual test harness can
+ * try this shape against a real device/carrier and observe the raw OS
+ * response. Do not call this from production code.
+ *
+ * Not `internal`: exposed (behind [ExperimentalSaaApi] opt-in and
+ * [VisibleForTesting]) so the `clientlibrarytestapp` module's manual test
+ * harness can call it directly. It is not intended for use by SDK
+ * consumers outside of testing/experimentation.
+ */
+@ExperimentalSaaApi
+@VisibleForTesting
+fun buildMergedDcqlRequestJson(
+    vpResponse: VpResponse,
+    credentialAuthorizationJwt: String
+): String {
+    val credential = JSONObject()
+        .put("id", vpResponse.id)
+        .put("format", vpResponse.format)
+        .put("meta", JSONObject().put("vct_values", JSONArray(vpResponse.meta.vctValues)))
+        .put("claims", JSONArray(vpResponse.claims.map { claim ->
+            JSONObject()
+                .put("path", JSONArray(claim.path))
+                .put("values", JSONArray(claim.values))
+        }))
+
+    val dcqlQuery = JSONObject().put("credentials", JSONArray().put(credential))
+
+    return JSONObject()
+        .put("protocol", "openid4vp-v1-unsigned")
+        .put("data", JSONObject()
+            .put("response_type", "vp_token")
+            .put("response_mode", "dc_api")
+            .put("dcql_query", dcqlQuery)
+            .put("request", credentialAuthorizationJwt)  // placement unverified — may belong elsewhere or not at all
+        )
+        .toString()
 }
