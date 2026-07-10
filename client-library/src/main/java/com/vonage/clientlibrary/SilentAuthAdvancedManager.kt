@@ -92,18 +92,29 @@ class SilentAuthAdvancedManager(
         callback: (SaaResult) -> Unit
     ) {
         initDebuggable(activity)
+
+        val vpResponse = authzData.vpResponse
+        if (vpResponse == null) {
+            errorLog("vpResponse is missing from SimBasedAuthzData")
+            dispatch(callback, SaaResult.Error(
+                SaaErrorCode.MALFORMED_PAYLOAD,
+                "vpResponse is missing from SimBasedAuthzData"
+            ))
+            return
+        }
+
         debugLog("┌────── SAA: requestOperatorToken ──────────────────────────")
-        debugLog("│ vpResponse.id: ${authzData.vpResponse.id}")
-        debugLog("│ vpResponse.format: ${authzData.vpResponse.format}")
-        debugLog("│ vpResponse.meta.vctValues: ${authzData.vpResponse.meta.vctValues}")
-        debugLog("│ vpResponse.meta.credentialAuthorizationJwt: ${authzData.vpResponse.meta.credentialAuthorizationJwt.take(50)}...")
-        debugLog("│ vpResponse.claims: ${authzData.vpResponse.claims}")
+        debugLog("│ vpResponse.id: ${vpResponse.id}")
+        debugLog("│ vpResponse.format: ${vpResponse.format}")
+        debugLog("│ vpResponse.meta.vctValues: ${vpResponse.meta.vctValues}")
+        debugLog("│ vpResponse.meta.credentialAuthorizationJwt: ${vpResponse.meta.credentialAuthorizationJwt.take(50)}...")
+        debugLog("│ vpResponse.claims: ${vpResponse.claims}")
         debugLog("│ androidAppUrl: ${authzData.androidAppUrl}")
         debugLog("│ appInfoJwt present: ${authzData.appInfoJwt != null}")
         debugLog("└────────────────────────────────────────────────────────────")
 
         // Validate the payload before attempting anything
-        val jwt = authzData.vpResponse.meta.credentialAuthorizationJwt
+        val jwt = vpResponse.meta.credentialAuthorizationJwt
         if (jwt.isBlank()) {
             errorLog("credential_authorization_jwt is missing or empty")
             dispatch(callback, SaaResult.Error(
@@ -115,7 +126,7 @@ class SilentAuthAdvancedManager(
 
         // Virtual operator test numbers: prefix +990
         // Even last digit → success (simulated); odd last digit → failure
-        val phoneHint = authzData.vpResponse.claims
+        val phoneHint = vpResponse.claims
             .firstOrNull { it.path.contains("phone_number_hint") }
             ?.values
             ?.firstOrNull()

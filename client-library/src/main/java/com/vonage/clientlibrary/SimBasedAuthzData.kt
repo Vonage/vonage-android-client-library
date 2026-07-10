@@ -110,8 +110,14 @@ data class VpResponse(
  */
 @ExperimentalSaaApi
 data class SimBasedAuthzData(
-    /** The verifiable presentation response containing credential request details. */
-    val vpResponse: VpResponse,
+    /**
+     * The verifiable presentation response containing credential request
+     * details. Nullable because `vpResponse` is not guaranteed by any fixed
+     * spec — the wire shape of `sim_based_authz_data` is defined by Vonage's
+     * Verify backend and carrier aggregators, and testers may need to
+     * construct/parse payloads that omit it.
+     */
+    val vpResponse: VpResponse?,
     /**
      * Deep-link URL to the carrier's native app, used as a fallback on devices
      * that do not support the native TS.43 SDK path.
@@ -131,13 +137,17 @@ data class SimBasedAuthzData(
          * Parses a [SimBasedAuthzData] from a [JSONObject] representing the
          * `sim_based_authz_data` field of a Vonage Verify `action_pending` callback.
          *
-         * @throws IllegalArgumentException if the `vpResponse` field is missing or malformed.
+         * [vpResponse] is parsed if present, and is `null` if the top-level
+         * `vpResponse` key is absent from [json]. `vpResponse` is not part of
+         * any fixed spec for this payload, so its absence is not treated as
+         * malformed input at parse time. Callers that require it (e.g.
+         * [SilentAuthAdvancedManager.requestOperatorToken]) are responsible
+         * for deciding how to handle a `null` [SimBasedAuthzData.vpResponse].
          */
         fun fromJson(json: JSONObject): SimBasedAuthzData {
             val vpResponseJson = json.optJSONObject("vpResponse")
-                ?: throw IllegalArgumentException("Missing required field: vpResponse")
             return SimBasedAuthzData(
-                vpResponse = VpResponse.fromJson(vpResponseJson),
+                vpResponse = vpResponseJson?.let { VpResponse.fromJson(it) },
                 androidAppUrl = json.optStringOrNull("androidAppUrl"),
                 appInfoJwt = json.optStringOrNull("appInfoJwt"),
                 iOSAppClipUrl = json.optStringOrNull("iOSAppClipUrl")
