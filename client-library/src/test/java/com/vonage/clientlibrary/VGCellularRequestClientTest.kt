@@ -149,6 +149,7 @@ class VGCellularRequestClientTest {
         val mockManager = mockk<SilentAuthAdvancedManager>(relaxed = true)
 
         val authzData = SimBasedAuthzData(
+            requestId = "req-123",
             vpResponse = VpResponse(
                 id = "gnp",
                 format = "dc-authorization+sd-jwt",
@@ -182,6 +183,7 @@ class VGCellularRequestClientTest {
         val mockManager = mockk<SilentAuthAdvancedManager>(relaxed = true)
 
         val authzData = SimBasedAuthzData(
+            requestId = "req-456",
             vpResponse = VpResponse(
                 id = "gnp",
                 format = "dc-authorization+sd-jwt",

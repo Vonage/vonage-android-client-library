@@ -21,8 +21,8 @@ import androidx.credentials.exceptions.GetCredentialUnsupportedException
  * ## Typical usage
  *
  * ```kotlin
- * // 1. Receive sim_based_authz_data from your backend
- * val authzData = SimBasedAuthzData.fromJson(JSONObject(jsonFromBackend))
+ * // 1. Receive the Verify webhook event from your backend
+ * val authzData = SimBasedAuthzData.fromVerifyEvent(JSONObject(webhookEventJson))
  *
  * // 2. Request the operator token
  * val manager = SilentAuthAdvancedManager()
@@ -94,16 +94,9 @@ class SilentAuthAdvancedManager(
         initDebuggable(activity)
 
         val vpResponse = authzData.vpResponse
-        if (vpResponse == null) {
-            errorLog("vpResponse is missing from SimBasedAuthzData")
-            dispatch(callback, SaaResult.Error(
-                SaaErrorCode.MALFORMED_PAYLOAD,
-                "vpResponse is missing from SimBasedAuthzData"
-            ))
-            return
-        }
 
         debugLog("┌────── SAA: requestOperatorToken ──────────────────────────")
+        debugLog("│ requestId (nonce): ${authzData.requestId}")
         debugLog("│ vpResponse.id: ${vpResponse.id}")
         debugLog("│ vpResponse.format: ${vpResponse.format}")
         debugLog("│ vpResponse.meta.vctValues: ${vpResponse.meta.vctValues}")
@@ -112,17 +105,6 @@ class SilentAuthAdvancedManager(
         debugLog("│ androidAppUrl: ${authzData.androidAppUrl}")
         debugLog("│ appInfoJwt present: ${authzData.appInfoJwt != null}")
         debugLog("└────────────────────────────────────────────────────────────")
-
-        // Validate the payload before attempting anything
-        val jwt = vpResponse.meta.credentialAuthorizationJwt
-        if (jwt.isBlank()) {
-            errorLog("credential_authorization_jwt is missing or empty")
-            dispatch(callback, SaaResult.Error(
-                SaaErrorCode.MALFORMED_PAYLOAD,
-                "credential_authorization_jwt is missing or empty"
-            ))
-            return
-        }
 
         // Virtual operator test numbers: prefix +990
         // Even last digit → success (simulated); odd last digit → failure
@@ -137,12 +119,16 @@ class SilentAuthAdvancedManager(
             return
         }
 
+        // Build the OpenID4VP CredentialManager request from the request_id
+        // (nonce) and the vpResponse.
+        val requestJson = buildTs43CredentialRequestJson(authzData.requestId, vpResponse)
+
         // Attempt native TS.43 path
         val nativeAvailable = tokenProvider.isNativePathAvailable(activity)
         debugLog("Native TS.43 path available: $nativeAvailable")
         if (nativeAvailable) {
             debugLog("Requesting token via native CredentialManager...")
-            tokenProvider.requestToken(activity, jwt) { token, error ->
+            tokenProvider.requestToken(activity, requestJson) { token, error ->
                 when {
                     token != null -> {
                         debugLog("Token received (${token.toByteArray(Charsets.UTF_8).size} bytes)")
