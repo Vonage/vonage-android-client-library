@@ -2,7 +2,6 @@ package com.vonage.clientlibrary
 
 import android.app.Activity
 import io.mockk.*
-import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.*
@@ -18,229 +17,206 @@ import org.robolectric.annotation.Config
 class SimBasedAuthzDataTest {
 
     // ------------------------------------------------------------------
-    // Full payload fixture
+    // Full Verify webhook event fixture
     // ------------------------------------------------------------------
 
-    private val fullPayloadJson = """
+    private val fullEventJson = """
         {
-          "vpResponse": {
-            "id": "gnp",
-            "format": "dc-authorization+sd-jwt",
-            "meta": {
-              "vct_values": ["number-verification/device-phone-number/ts43"],
-              "credential_authorization_jwt": "aaa.bbb.ccc"
-            },
-            "claims": [
-              {
-                "path": ["phone_number_hint"],
-                "values": ["+467234524553"]
-              }
-            ]
+          "request_id": "a2fd32bf-b13a-42a9-a325-69270216d204",
+          "triggered_at": "2026-07-16T15:02:43.374Z",
+          "channel": "silent_auth",
+          "status": "action_pending",
+          "action": {
+            "type": "auth",
+            "sim_based_authz_data": {
+              "vpResponse": {
+                "id": "gnp",
+                "format": "dc-authorization+sd-jwt",
+                "meta": {
+                  "vct_values": ["number-verification/device-phone-number/ts43"],
+                  "credential_authorization_jwt": "aaa.bbb.ccc"
+                },
+                "claims": [
+                  {
+                    "path": ["phone_number_hint"],
+                    "values": ["+467234524553"]
+                  }
+                ]
+              },
+              "androidAppUrl": "https://carrier.example.com/app?scope=verify",
+              "appInfoJwt": "app-info-jwt-value",
+              "iOSAppClipUrl": "https://appclip.example.com/verify"
+            }
           },
-          "androidAppUrl": "https://carrier.example.com/app?scope=verify",
-          "appInfoJwt": "app-info-jwt-value",
-          "iOSAppClipUrl": "https://appclip.example.com/verify"
+          "mode": "advanced",
+          "type": "event"
         }
     """.trimIndent()
 
     // ------------------------------------------------------------------
-    // SimBasedAuthzData.fromJson — parsing tests
+    // SimBasedAuthzData.fromVerifyEvent — parsing tests
     // ------------------------------------------------------------------
 
     @Test
-    fun `fromJson parses vpResponse id and format`() {
-        val data = SimBasedAuthzData.fromJson(JSONObject(fullPayloadJson))
-        assertEquals("gnp", data.vpResponse!!.id)
-        assertEquals("dc-authorization+sd-jwt", data.vpResponse!!.format)
+    fun `fromVerifyEvent parses request_id as the nonce`() {
+        val data = SimBasedAuthzData.fromVerifyEvent(JSONObject(fullEventJson))
+        assertEquals("a2fd32bf-b13a-42a9-a325-69270216d204", data.requestId)
     }
 
     @Test
-    fun `fromJson parses vpResponse meta vct_values`() {
-        val data = SimBasedAuthzData.fromJson(JSONObject(fullPayloadJson))
-        assertEquals(listOf("number-verification/device-phone-number/ts43"), data.vpResponse!!.meta.vctValues)
+    fun `fromVerifyEvent parses vpResponse id and format`() {
+        val data = SimBasedAuthzData.fromVerifyEvent(JSONObject(fullEventJson))
+        assertEquals("gnp", data.vpResponse.id)
+        assertEquals("dc-authorization+sd-jwt", data.vpResponse.format)
     }
 
     @Test
-    fun `fromJson parses vpResponse meta credential_authorization_jwt`() {
-        val data = SimBasedAuthzData.fromJson(JSONObject(fullPayloadJson))
-        assertEquals("aaa.bbb.ccc", data.vpResponse!!.meta.credentialAuthorizationJwt)
+    fun `fromVerifyEvent parses vpResponse meta vct_values`() {
+        val data = SimBasedAuthzData.fromVerifyEvent(JSONObject(fullEventJson))
+        assertEquals(listOf("number-verification/device-phone-number/ts43"), data.vpResponse.meta.vctValues)
     }
 
     @Test
-    fun `fromJson parses claims path and values`() {
-        val data = SimBasedAuthzData.fromJson(JSONObject(fullPayloadJson))
-        assertEquals(1, data.vpResponse!!.claims.size)
-        assertEquals(listOf("phone_number_hint"), data.vpResponse!!.claims[0].path)
-        assertEquals(listOf("+467234524553"), data.vpResponse!!.claims[0].values)
+    fun `fromVerifyEvent parses vpResponse meta credential_authorization_jwt`() {
+        val data = SimBasedAuthzData.fromVerifyEvent(JSONObject(fullEventJson))
+        assertEquals("aaa.bbb.ccc", data.vpResponse.meta.credentialAuthorizationJwt)
     }
 
     @Test
-    fun `fromJson parses androidAppUrl`() {
-        val data = SimBasedAuthzData.fromJson(JSONObject(fullPayloadJson))
+    fun `fromVerifyEvent parses claims path and values`() {
+        val data = SimBasedAuthzData.fromVerifyEvent(JSONObject(fullEventJson))
+        assertEquals(1, data.vpResponse.claims.size)
+        assertEquals(listOf("phone_number_hint"), data.vpResponse.claims[0].path)
+        assertEquals(listOf("+467234524553"), data.vpResponse.claims[0].values)
+    }
+
+    @Test
+    fun `fromVerifyEvent parses androidAppUrl appInfoJwt and iOSAppClipUrl`() {
+        val data = SimBasedAuthzData.fromVerifyEvent(JSONObject(fullEventJson))
         assertEquals("https://carrier.example.com/app?scope=verify", data.androidAppUrl)
-    }
-
-    @Test
-    fun `fromJson parses appInfoJwt`() {
-        val data = SimBasedAuthzData.fromJson(JSONObject(fullPayloadJson))
         assertEquals("app-info-jwt-value", data.appInfoJwt)
-    }
-
-    @Test
-    fun `fromJson parses iOSAppClipUrl`() {
-        val data = SimBasedAuthzData.fromJson(JSONObject(fullPayloadJson))
         assertEquals("https://appclip.example.com/verify", data.iOSAppClipUrl)
     }
 
     @Test
-    fun `fromJson sets optional fields to null when absent`() {
+    fun `fromVerifyEvent sets optional fields to null when absent`() {
         val minimal = """
             {
-              "vpResponse": {
-                "id": "gnp",
-                "format": "dc-authorization+sd-jwt",
-                "meta": {
-                  "vct_values": [],
-                  "credential_authorization_jwt": "aaa.bbb.ccc"
-                },
-                "claims": []
+              "request_id": "req-1",
+              "action": {
+                "sim_based_authz_data": {
+                  "vpResponse": {
+                    "id": "gnp",
+                    "format": "dc-authorization+sd-jwt",
+                    "meta": {
+                      "vct_values": [],
+                      "credential_authorization_jwt": "aaa.bbb.ccc"
+                    },
+                    "claims": []
+                  }
+                }
               }
             }
         """.trimIndent()
-        val data = SimBasedAuthzData.fromJson(JSONObject(minimal))
+        val data = SimBasedAuthzData.fromVerifyEvent(JSONObject(minimal))
         assertNull(data.androidAppUrl)
         assertNull(data.appInfoJwt)
         assertNull(data.iOSAppClipUrl)
     }
 
     @Test
-    fun `fromJson treats JSON null values for optional string fields as null`() {
-        // Issue 1: JSONObject.optString returns the literal string "null" for JSON null;
-        // optStringOrNull must guard against that.
-        val withJsonNulls = """
+    fun `fromVerifyEvent accepts sim_based_authz_data at the top level without action wrapper`() {
+        val topLevel = """
             {
-              "vpResponse": {
-                "id": "gnp",
-                "format": "dc-authorization+sd-jwt",
-                "meta": {
-                  "vct_values": [],
-                  "credential_authorization_jwt": "aaa.bbb.ccc"
-                },
-                "claims": []
-              },
-              "androidAppUrl": null,
-              "appInfoJwt": null,
-              "iOSAppClipUrl": null
+              "request_id": "req-2",
+              "sim_based_authz_data": {
+                "vpResponse": {
+                  "id": "gnp",
+                  "format": "dc-authorization+sd-jwt",
+                  "meta": { "vct_values": [], "credential_authorization_jwt": "jwt" },
+                  "claims": []
+                }
+              }
             }
         """.trimIndent()
-        val data = SimBasedAuthzData.fromJson(JSONObject(withJsonNulls))
-        assertNull(data.androidAppUrl)
-        assertNull(data.appInfoJwt)
-        assertNull(data.iOSAppClipUrl)
+        val data = SimBasedAuthzData.fromVerifyEvent(JSONObject(topLevel))
+        assertEquals("req-2", data.requestId)
+        assertEquals("gnp", data.vpResponse.id)
     }
 
     @Test
-    fun `fromJson treats empty string values for optional string fields as null`() {
-        val withEmptyStrings = """
+    fun `fromVerifyEvent throws when request_id is missing`() {
+        val noRequestId = """
             {
-              "vpResponse": {
-                "id": "gnp",
-                "format": "dc-authorization+sd-jwt",
-                "meta": {
-                  "vct_values": [],
-                  "credential_authorization_jwt": "aaa.bbb.ccc"
-                },
-                "claims": []
-              },
-              "androidAppUrl": "",
-              "appInfoJwt": "",
-              "iOSAppClipUrl": ""
+              "action": {
+                "sim_based_authz_data": {
+                  "vpResponse": {
+                    "id": "gnp", "format": "f",
+                    "meta": { "vct_values": [], "credential_authorization_jwt": "j" },
+                    "claims": []
+                  }
+                }
+              }
             }
         """.trimIndent()
-        val data = SimBasedAuthzData.fromJson(JSONObject(withEmptyStrings))
-        assertNull(data.androidAppUrl)
-        assertNull(data.appInfoJwt)
-        assertNull(data.iOSAppClipUrl)
+        assertThrows(IllegalArgumentException::class.java) {
+            SimBasedAuthzData.fromVerifyEvent(JSONObject(noRequestId))
+        }
     }
 
     @Test
-    fun `fromJson sets vpResponse to null when absent`() {
-        // vpResponse is not part of any fixed spec for this payload — its
-        // absence is not treated as malformed input at parse time.
-        val data = SimBasedAuthzData.fromJson(JSONObject("{}"))
-        assertNull(data.vpResponse)
+    fun `fromVerifyEvent throws when sim_based_authz_data is missing`() {
+        val noSimData = """{ "request_id": "req-1", "action": { "type": "auth" } }"""
+        assertThrows(IllegalArgumentException::class.java) {
+            SimBasedAuthzData.fromVerifyEvent(JSONObject(noSimData))
+        }
     }
 
     @Test
-    fun `fromJson handles multiple claims`() {
+    fun `fromVerifyEvent throws when vpResponse is missing`() {
+        val noVpResponse = """
+            {
+              "request_id": "req-1",
+              "action": { "sim_based_authz_data": { "androidAppUrl": "https://x" } }
+            }
+        """.trimIndent()
+        assertThrows(IllegalArgumentException::class.java) {
+            SimBasedAuthzData.fromVerifyEvent(JSONObject(noVpResponse))
+        }
+    }
+
+    @Test
+    fun `fromVerifyEvent handles multiple claims`() {
         val json = """
             {
-              "vpResponse": {
-                "id": "gnp",
-                "format": "dc-authorization+sd-jwt",
-                "meta": {
-                  "vct_values": [],
-                  "credential_authorization_jwt": "jwt"
-                },
-                "claims": [
-                  { "path": ["phone_number_hint"], "values": ["+1234567890"] },
-                  { "path": ["country"], "values": ["US"] }
-                ]
+              "request_id": "req-1",
+              "action": {
+                "sim_based_authz_data": {
+                  "vpResponse": {
+                    "id": "gnp",
+                    "format": "dc-authorization+sd-jwt",
+                    "meta": { "vct_values": [], "credential_authorization_jwt": "jwt" },
+                    "claims": [
+                      { "path": ["carrier_hint"], "values": ["310150"] },
+                      { "path": ["phone_number_hint"], "values": ["+1234567890"] }
+                    ]
+                  }
+                }
               }
             }
         """.trimIndent()
-        val data = SimBasedAuthzData.fromJson(JSONObject(json))
-        assertEquals(2, data.vpResponse!!.claims.size)
-        assertEquals("country", data.vpResponse!!.claims[1].path[0])
-        assertEquals("US", data.vpResponse!!.claims[1].values[0])
+        val data = SimBasedAuthzData.fromVerifyEvent(JSONObject(json))
+        assertEquals(2, data.vpResponse.claims.size)
+        assertEquals("carrier_hint", data.vpResponse.claims[0].path[0])
+        assertEquals("310150", data.vpResponse.claims[0].values[0])
+        assertEquals("phone_number_hint", data.vpResponse.claims[1].path[0])
     }
 }
 
 @OptIn(ExperimentalSaaApi::class)
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], manifest = Config.NONE)
-class SaaRequestBuildersTest {
-
-    // ------------------------------------------------------------------
-    // buildDefaultRequestJson — Task 1 refactor, literal output check
-    // ------------------------------------------------------------------
-
-    @Test
-    fun `buildDefaultRequestJson produces literal expected JSON`() {
-        val json = buildDefaultRequestJson("aaa.bbb.ccc")
-        assertEquals(
-            JSONObject(mapOf("credential_authorization_jwt" to "aaa.bbb.ccc")).toString(),
-            json
-        )
-        assertEquals("aaa.bbb.ccc", JSONObject(json).getString("credential_authorization_jwt"))
-    }
-
-    // ------------------------------------------------------------------
-    // buildSignedPassthroughRequestJson
-    // ------------------------------------------------------------------
-
-    @Test
-    fun `buildSignedPassthroughRequestJson wraps jwt under protocol and data-request`() {
-        val json = buildSignedPassthroughRequestJson("aaa.bbb.ccc")
-        val parsed = JSONObject(json)
-
-        assertEquals("openid4vp-v1-signed", parsed.getString("protocol"))
-        assertEquals("aaa.bbb.ccc", parsed.getJSONObject("data").getString("request"))
-    }
-
-    @Test
-    fun `buildSignedPassthroughRequestJson produces literal expected JSON`() {
-        val json = buildSignedPassthroughRequestJson("aaa.bbb.ccc")
-        val expected = JSONObject()
-            .put("protocol", "openid4vp-v1-signed")
-            .put("data", JSONObject().put("request", "aaa.bbb.ccc"))
-            .toString()
-        assertEquals(expected, json)
-    }
-
-    // ------------------------------------------------------------------
-    // buildMergedDcqlRequestJson
-    // ------------------------------------------------------------------
+class Ts43CredentialRequestBuilderTest {
 
     private fun sampleVpResponse(): VpResponse = VpResponse(
         id = "gnp",
@@ -249,54 +225,91 @@ class SaaRequestBuildersTest {
             vctValues = listOf("number-verification/device-phone-number/ts43"),
             credentialAuthorizationJwt = "aaa.bbb.ccc"
         ),
-        claims = listOf(VpClaim(path = listOf("phone_number_hint"), values = listOf("+467234524553")))
+        claims = listOf(
+            VpClaim(path = listOf("carrier_hint"), values = listOf("310150")),
+            VpClaim(path = listOf("phone_number_hint"), values = listOf("+467234524553"))
+        )
     )
 
     @Test
-    fun `buildMergedDcqlRequestJson produces literal expected JSON`() {
-        val json = buildMergedDcqlRequestJson(sampleVpResponse(), "aaa.bbb.ccc")
+    fun `builds the top-level requests array with unsigned protocol`() {
+        val json = buildTs43CredentialRequestJson("req-123", sampleVpResponse())
+        val parsed = JSONObject(json)
 
-        val credential = JSONObject()
-            .put("id", "gnp")
-            .put("format", "dc-authorization+sd-jwt")
-            .put("meta", JSONObject().put("vct_values", JSONArray(listOf("number-verification/device-phone-number/ts43"))))
-            .put("claims", JSONArray().put(
-                JSONObject()
-                    .put("path", JSONArray(listOf("phone_number_hint")))
-                    .put("values", JSONArray(listOf("+467234524553")))
-            ))
-        val dcqlQuery = JSONObject().put("credentials", JSONArray().put(credential))
-        val expected = JSONObject()
-            .put("protocol", "openid4vp-v1-unsigned")
-            .put("data", JSONObject()
-                .put("response_type", "vp_token")
-                .put("response_mode", "dc_api")
-                .put("dcql_query", dcqlQuery)
-                .put("request", "aaa.bbb.ccc")
-            )
-            .toString()
-
-        assertEquals(expected, json)
+        val requests = parsed.getJSONArray("requests")
+        assertEquals(1, requests.length())
+        assertEquals("openid4vp-v1-unsigned", requests.getJSONObject(0).getString("protocol"))
     }
 
     @Test
-    fun `buildMergedDcqlRequestJson embeds vpResponse fields into dcql_query credentials`() {
-        val json = buildMergedDcqlRequestJson(sampleVpResponse(), "aaa.bbb.ccc")
-        val parsed = JSONObject(json)
+    fun `data carries nonce from request_id and hardcoded response params`() {
+        val json = buildTs43CredentialRequestJson("req-123", sampleVpResponse())
+        val data = JSONObject(json).getJSONArray("requests").getJSONObject(0).getJSONObject("data")
 
-        assertEquals("openid4vp-v1-unsigned", parsed.getString("protocol"))
-        val data = parsed.getJSONObject("data")
+        assertEquals("req-123", data.getString("nonce"))
         assertEquals("vp_token", data.getString("response_type"))
         assertEquals("dc_api", data.getString("response_mode"))
-        assertEquals("aaa.bbb.ccc", data.getString("request"))
+    }
 
-        val credential = data.getJSONObject("dcql_query").getJSONArray("credentials").getJSONObject(0)
+    @Test
+    fun `dcql_query credential carries id format and jwt inside meta`() {
+        val json = buildTs43CredentialRequestJson("req-123", sampleVpResponse())
+        val credential = JSONObject(json)
+            .getJSONArray("requests").getJSONObject(0)
+            .getJSONObject("data")
+            .getJSONObject("dcql_query")
+            .getJSONArray("credentials").getJSONObject(0)
+
         assertEquals("gnp", credential.getString("id"))
         assertEquals("dc-authorization+sd-jwt", credential.getString("format"))
-        assertEquals(
-            "phone_number_hint",
-            credential.getJSONArray("claims").getJSONObject(0).getJSONArray("path").getString(0)
-        )
+
+        val meta = credential.getJSONObject("meta")
+        assertEquals("number-verification/device-phone-number/ts43", meta.getJSONArray("vct_values").getString(0))
+        // The JWT must be nested inside meta, next to vct_values.
+        assertEquals("aaa.bbb.ccc", meta.getString("credential_authorization_jwt"))
+    }
+
+    @Test
+    fun `dcql_query credential copies claims path and values`() {
+        val json = buildTs43CredentialRequestJson("req-123", sampleVpResponse())
+        val claims = JSONObject(json)
+            .getJSONArray("requests").getJSONObject(0)
+            .getJSONObject("data")
+            .getJSONObject("dcql_query")
+            .getJSONArray("credentials").getJSONObject(0)
+            .getJSONArray("claims")
+
+        assertEquals(2, claims.length())
+        assertEquals("carrier_hint", claims.getJSONObject(0).getJSONArray("path").getString(0))
+        assertEquals("310150", claims.getJSONObject(0).getJSONArray("values").getString(0))
+        assertEquals("phone_number_hint", claims.getJSONObject(1).getJSONArray("path").getString(0))
+        assertEquals("+467234524553", claims.getJSONObject(1).getJSONArray("values").getString(0))
+    }
+
+    @Test
+    fun `end-to-end from webhook event produces a valid request`() {
+        val event = """
+            {
+              "request_id": "req-xyz",
+              "action": {
+                "sim_based_authz_data": {
+                  "vpResponse": {
+                    "id": "gnp",
+                    "format": "dc-authorization+sd-jwt",
+                    "meta": { "vct_values": ["v"], "credential_authorization_jwt": "the-jwt" },
+                    "claims": []
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+        val authzData = SimBasedAuthzData.fromVerifyEvent(JSONObject(event))
+        val json = buildTs43CredentialRequestJson(authzData.requestId, authzData.vpResponse)
+        val data = JSONObject(json).getJSONArray("requests").getJSONObject(0).getJSONObject("data")
+
+        assertEquals("req-xyz", data.getString("nonce"))
+        val meta = data.getJSONObject("dcql_query").getJSONArray("credentials").getJSONObject(0).getJSONObject("meta")
+        assertEquals("the-jwt", meta.getString("credential_authorization_jwt"))
     }
 }
 
@@ -324,6 +337,7 @@ class SilentAuthAdvancedManagerTest {
     // ------------------------------------------------------------------
 
     private fun makeAuthzData(
+        requestId: String = "req-123",
         jwt: String = "aaa.bbb.ccc",
         phoneHint: String? = "+467234524553",
         androidAppUrl: String? = null,
@@ -335,6 +349,7 @@ class SilentAuthAdvancedManagerTest {
             emptyList()
         }
         return SimBasedAuthzData(
+            requestId = requestId,
             vpResponse = VpResponse(
                 id = "gnp",
                 format = "dc-authorization+sd-jwt",
@@ -350,32 +365,26 @@ class SilentAuthAdvancedManagerTest {
     }
 
     // ------------------------------------------------------------------
-    // Malformed payload
+    // Request construction — the manager builds the full requestJson
     // ------------------------------------------------------------------
 
     @Test
-    fun `returns MALFORMED_PAYLOAD error when vpResponse is null`() {
+    fun `native path sends a requestJson containing the nonce and jwt inside meta`() {
+        every { mockProvider.isNativePathAvailable(any()) } returns true
+        val requestJsonSlot = slot<String>()
+        every { mockProvider.requestToken(any(), capture(requestJsonSlot), any()) } answers {
+            thirdArg<(String?, Exception?) -> Unit>()(null, IllegalStateException("simulated OS rejection"))
+        }
+
         val manager = SilentAuthAdvancedManager(mockProvider)
-        var result: SaaResult? = null
-        val authzData = SimBasedAuthzData(
-            vpResponse = null,
-            androidAppUrl = null,
-            appInfoJwt = null
-        )
-        manager.requestOperatorToken(mockActivity, authzData) { result = it }
+        // Use a non-virtual phone hint so it reaches the native path.
+        manager.requestOperatorToken(mockActivity, makeAuthzData(requestId = "req-abc", phoneHint = "+15551234567")) {}
 
-        val error = result as SaaResult.Error
-        assertEquals(SaaErrorCode.MALFORMED_PAYLOAD, error.code)
-    }
-
-    @Test
-    fun `returns MALFORMED_PAYLOAD error when credential_authorization_jwt is blank`() {
-        val manager = SilentAuthAdvancedManager(mockProvider)
-        var result: SaaResult? = null
-        manager.requestOperatorToken(mockActivity, makeAuthzData(jwt = "")) { result = it }
-
-        val error = result as SaaResult.Error
-        assertEquals(SaaErrorCode.MALFORMED_PAYLOAD, error.code)
+        val parsed = JSONObject(requestJsonSlot.captured)
+        val data = parsed.getJSONArray("requests").getJSONObject(0).getJSONObject("data")
+        assertEquals("req-abc", data.getString("nonce"))
+        val meta = data.getJSONObject("dcql_query").getJSONArray("credentials").getJSONObject(0).getJSONObject("meta")
+        assertEquals("aaa.bbb.ccc", meta.getString("credential_authorization_jwt"))
     }
 
     // ------------------------------------------------------------------
@@ -425,7 +434,7 @@ class SilentAuthAdvancedManagerTest {
 
         val manager = SilentAuthAdvancedManager(mockProvider)
         var result: SaaResult? = null
-        manager.requestOperatorToken(mockActivity, makeAuthzData()) { result = it }
+        manager.requestOperatorToken(mockActivity, makeAuthzData(phoneHint = "+15551234567")) { result = it }
 
         val success = result as SaaResult.Success
         assertEquals("valid-operator-token", success.token)
@@ -442,7 +451,7 @@ class SilentAuthAdvancedManagerTest {
 
         val manager = SilentAuthAdvancedManager(mockProvider)
         var result: SaaResult? = null
-        manager.requestOperatorToken(mockActivity, makeAuthzData()) { result = it }
+        manager.requestOperatorToken(mockActivity, makeAuthzData(phoneHint = "+15551234567")) { result = it }
 
         val error = result as SaaResult.Error
         assertEquals(SaaErrorCode.TOKEN_TOO_LARGE, error.code)
@@ -458,7 +467,7 @@ class SilentAuthAdvancedManagerTest {
 
         val manager = SilentAuthAdvancedManager(mockProvider)
         var result: SaaResult? = null
-        manager.requestOperatorToken(mockActivity, makeAuthzData()) { result = it }
+        manager.requestOperatorToken(mockActivity, makeAuthzData(phoneHint = "+15551234567")) { result = it }
 
         val error = result as SaaResult.Error
         assertEquals(SaaErrorCode.UNKNOWN, error.code)
@@ -476,7 +485,7 @@ class SilentAuthAdvancedManagerTest {
         var result: SaaResult? = null
         manager.requestOperatorToken(
             mockActivity,
-            makeAuthzData(androidAppUrl = "https://carrier.example.com/app")
+            makeAuthzData(phoneHint = "+15551234567", androidAppUrl = "https://carrier.example.com/app")
         ) { result = it }
 
         assertTrue(result is SaaResult.DeepLinkRequired)
@@ -492,7 +501,7 @@ class SilentAuthAdvancedManagerTest {
         var result: SaaResult? = null
         manager.requestOperatorToken(
             mockActivity,
-            makeAuthzData(androidAppUrl = "https://carrier.example.com/app", appInfoJwt = "my-app-jwt")
+            makeAuthzData(phoneHint = "+15551234567", androidAppUrl = "https://carrier.example.com/app", appInfoJwt = "my-app-jwt")
         ) { result = it }
 
         val deepLink = result as SaaResult.DeepLinkRequired
@@ -505,7 +514,7 @@ class SilentAuthAdvancedManagerTest {
 
         val manager = SilentAuthAdvancedManager(mockProvider)
         var result: SaaResult? = null
-        manager.requestOperatorToken(mockActivity, makeAuthzData()) { result = it }
+        manager.requestOperatorToken(mockActivity, makeAuthzData(phoneHint = "+15551234567")) { result = it }
 
         val error = result as SaaResult.Error
         assertEquals(SaaErrorCode.UNSUPPORTED_NETWORK, error.code)
@@ -573,6 +582,7 @@ class SilentAuthAdvancedManagerTest {
         manager.requestOperatorToken(
             mockActivity,
             makeAuthzData(
+                phoneHint = "+15551234567",
                 androidAppUrl = "https://carrier.example.com/app",
                 appInfoJwt = "my-app-jwt"
             )
@@ -594,7 +604,7 @@ class SilentAuthAdvancedManagerTest {
 
         val manager = SilentAuthAdvancedManager(mockProvider)
         var result: SaaResult? = null
-        manager.requestOperatorToken(mockActivity, makeAuthzData()) { result = it }
+        manager.requestOperatorToken(mockActivity, makeAuthzData(phoneHint = "+15551234567")) { result = it }
 
         val error = result as SaaResult.Error
         assertEquals(SaaErrorCode.UNSUPPORTED_NETWORK, error.code)
@@ -613,7 +623,7 @@ class SilentAuthAdvancedManagerTest {
         var result: SaaResult? = null
         manager.requestOperatorToken(
             mockActivity,
-            makeAuthzData(androidAppUrl = "https://carrier.example.com/app")
+            makeAuthzData(phoneHint = "+15551234567", androidAppUrl = "https://carrier.example.com/app")
         ) { result = it }
 
         val error = result as SaaResult.Error
@@ -633,7 +643,7 @@ class SilentAuthAdvancedManagerTest {
         var result: SaaResult? = null
         manager.requestOperatorToken(
             mockActivity,
-            makeAuthzData(androidAppUrl = "https://carrier.example.com/app")
+            makeAuthzData(phoneHint = "+15551234567", androidAppUrl = "https://carrier.example.com/app")
         ) { result = it }
 
         val error = result as SaaResult.Error

@@ -135,8 +135,8 @@ Silent Auth Advanced performs a cryptographic challenge-response directly with t
 #### How it works
 
 1. Your backend calls `POST https://api.nexmo.com/v2/verify` with `"channel": "silent_auth", "mode": "advanced"`.
-2. Vonage sends an `action_pending` webhook to your backend containing a `sim_based_authz_data` object.
-3. Your backend delivers `sim_based_authz_data` to the app (via push or polling).
+2. Vonage sends an `action_pending` webhook event to your backend. The event contains the `request_id` at its top level and a `sim_based_authz_data` object (with a `vpResponse`) under `action`.
+3. Your backend delivers the **full webhook event** to the app (via push or polling). The whole event is needed — the app uses `request_id` as the OpenID4VP `nonce` and `action.sim_based_authz_data.vpResponse` to build the credential request.
 4. The app calls the SDK with the payload to obtain an operator token.
 5. Your backend submits the token to `POST https://api.nexmo.com/v2/verify/{request_id}` to complete verification.
 
@@ -150,11 +150,14 @@ import com.vonage.clientlibrary.VGCellularRequestClient
 import org.json.JSONObject
 
 @OptIn(ExperimentalSaaApi::class)
-fun performSilentAuthAdvanced(activity: Activity, simBasedAuthzDataJson: String) {
+fun performSilentAuthAdvanced(activity: Activity, verifyWebhookEventJson: String) {
     VGCellularRequestClient.initializeSdk(activity.applicationContext)
 
-    // Parse the sim_based_authz_data payload from your backend
-    val authzData = SimBasedAuthzData.fromJson(JSONObject(simBasedAuthzDataJson))
+    // Parse the full Verify webhook event your backend received from Vonage.
+    // fromVerifyEvent extracts request_id (the nonce) and
+    // action.sim_based_authz_data.vpResponse. It throws IllegalArgumentException
+    // if any of those required fields are missing.
+    val authzData = SimBasedAuthzData.fromVerifyEvent(JSONObject(verifyWebhookEventJson))
 
     VGCellularRequestClient.getInstance().requestSilentAuthAdvancedToken(activity, authzData) { result ->
         when (result) {
@@ -260,6 +263,7 @@ Example Logcat output for a successful SAA flow:
 
 ```
 D/VonageSAA: ┌────── SAA: requestOperatorToken ──────────────────────────
+D/VonageSAA: │ requestId (nonce): a2fd32bf-b13a-42a9-a325-69270216d204
 D/VonageSAA: │ vpResponse.id: gnp
 D/VonageSAA: │ vpResponse.format: dc-authorization+sd-jwt
 D/VonageSAA: │ vpResponse.meta.vctValues: [number-verification/device-phone-number/ts43]
@@ -272,7 +276,7 @@ D/VonageSAA: isNativePathAvailable: true (SDK_INT=34, required>=34)
 D/VonageSAA: Native TS.43 path available: true
 D/VonageSAA: Requesting token via native CredentialManager...
 D/VonageSAA: ┌────── CredentialManager Request ──────────────────────
-D/VonageSAA: │ requestJson: {"credential_authorization_jwt":"eyJhbG..."}
+D/VonageSAA: │ requestJson: {"requests":[{"protocol":"openid4vp-v1-unsigned","data":{"nonce":"a2fd32bf...","response_type":"vp_token","response_mode":"dc_api","dcql_query":{"credentials":[{"id":"gnp","format":"dc-authorization+sd-jwt","meta":{"vct_values":[...],"credential_authorization_jwt":"eyJhbG..."},"claims":[...]}]}}}]}
 D/VonageSAA: └──────────────────────────────────────────────────────
 D/VonageSAA: Calling credentialManager.getCredentialAsync...
 D/VonageSAA: ┌────── CredentialManager Response ─────────────────────

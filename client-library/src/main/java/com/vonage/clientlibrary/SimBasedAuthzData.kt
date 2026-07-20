@@ -95,29 +95,38 @@ data class VpResponse(
 }
 
 /**
- * Represents the `sim_based_authz_data` payload delivered to the app from the
- * customer's backend after a Vonage Verify Silent Auth Advanced request enters
- * the `action_pending` state.
+ * Represents the data the app needs to perform a Silent Auth Advanced (TS.43)
+ * challenge, extracted from the Vonage Verify `action_pending` webhook event.
+ *
+ * Construct this from the **full webhook event** your backend received from
+ * Vonage (via [fromVerifyEvent]). The event carries the `request_id` (used as
+ * the OpenID4VP `nonce`) at its top level and the `sim_based_authz_data`
+ * (containing `vpResponse`) under `action`. Both are required to build a valid
+ * TS.43 CredentialManager request.
  *
  * Pass this object to [SilentAuthAdvancedManager.requestOperatorToken] to
  * perform the TS.43 challenge-response and obtain an operator token for
  * submission to the Vonage Verify API.
  *
- * Example construction from a JSON string:
+ * Example construction from the raw webhook JSON:
  * ```kotlin
- * val data = SimBasedAuthzData.fromJson(JSONObject(jsonString))
+ * val data = SimBasedAuthzData.fromVerifyEvent(JSONObject(webhookEventJson))
  * ```
  */
 @ExperimentalSaaApi
 data class SimBasedAuthzData(
     /**
-     * The verifiable presentation response containing credential request
-     * details. Nullable because `vpResponse` is not guaranteed by any fixed
-     * spec — the wire shape of `sim_based_authz_data` is defined by Vonage's
-     * Verify backend and carrier aggregators, and testers may need to
-     * construct/parse payloads that omit it.
+     * The Verify `request_id` from the webhook event. Used as the OpenID4VP
+     * `nonce` in the CredentialManager request and to submit the resulting
+     * token to `POST /v2/verify/{request_id}`.
      */
-    val vpResponse: VpResponse?,
+    val requestId: String,
+    /**
+     * The verifiable presentation response containing the credential request
+     * details (id, format, meta with the credential authorization JWT, and
+     * claims). Required to build the TS.43 CredentialManager request.
+     */
+    val vpResponse: VpResponse,
     /**
      * Deep-link URL to the carrier's native app, used as a fallback on devices
      * that do not support the native TS.43 SDK path.
@@ -134,23 +143,55 @@ data class SimBasedAuthzData(
 ) {
     companion object {
         /**
-         * Parses a [SimBasedAuthzData] from a [JSONObject] representing the
-         * `sim_based_authz_data` field of a Vonage Verify `action_pending` callback.
+         * Parses a [SimBasedAuthzData] from the **full Vonage Verify webhook
+         * event** delivered to your backend when a Silent Auth Advanced request
+         * enters the `action_pending` state.
          *
-         * [vpResponse] is parsed if present, and is `null` if the top-level
-         * `vpResponse` key is absent from [json]. `vpResponse` is not part of
-         * any fixed spec for this payload, so its absence is not treated as
-         * malformed input at parse time. Callers that require it (e.g.
-         * [SilentAuthAdvancedManager.requestOperatorToken]) are responsible
-         * for deciding how to handle a `null` [SimBasedAuthzData.vpResponse].
+         * Expected structure (fields not shown are ignored):
+         * ```json
+         * {
+         *   "request_id": "…",
+         *   "action": {
+         *     "sim_based_authz_data": {
+         *       "vpResponse": { "id": "…", "format": "…", "meta": { … }, "claims": [ … ] },
+         *       "androidAppUrl": "…",
+         *       "appInfoJwt": "…"
+         *     }
+         *   }
+         * }
+         * ```
+         *
+         * `sim_based_authz_data` is also accepted at the top level of [event]
+         * (i.e. without the `action` wrapper) for resilience to minor delivery
+         * differences.
+         *
+         * @throws IllegalArgumentException if `request_id`, `sim_based_authz_data`,
+         *   or `vpResponse` is missing. These fields are required to build a valid
+         *   TS.43 request; treat this as a `MALFORMED_PAYLOAD` condition.
          */
-        fun fromJson(json: JSONObject): SimBasedAuthzData {
-            val vpResponseJson = json.optJSONObject("vpResponse")
+        fun fromVerifyEvent(event: JSONObject): SimBasedAuthzData {
+            val requestId = event.optStringOrNull("request_id")
+                ?: throw IllegalArgumentException(
+                    "Verify event is missing required 'request_id'"
+                )
+
+            val simData = event.optJSONObject("action")?.optJSONObject("sim_based_authz_data")
+                ?: event.optJSONObject("sim_based_authz_data")
+                ?: throw IllegalArgumentException(
+                    "Verify event is missing 'action.sim_based_authz_data'"
+                )
+
+            val vpResponseJson = simData.optJSONObject("vpResponse")
+                ?: throw IllegalArgumentException(
+                    "sim_based_authz_data is missing required 'vpResponse'"
+                )
+
             return SimBasedAuthzData(
-                vpResponse = vpResponseJson?.let { VpResponse.fromJson(it) },
-                androidAppUrl = json.optStringOrNull("androidAppUrl"),
-                appInfoJwt = json.optStringOrNull("appInfoJwt"),
-                iOSAppClipUrl = json.optStringOrNull("iOSAppClipUrl")
+                requestId = requestId,
+                vpResponse = VpResponse.fromJson(vpResponseJson),
+                androidAppUrl = simData.optStringOrNull("androidAppUrl"),
+                appInfoJwt = simData.optStringOrNull("appInfoJwt"),
+                iOSAppClipUrl = simData.optStringOrNull("iOSAppClipUrl")
             )
         }
     }

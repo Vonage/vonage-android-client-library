@@ -67,12 +67,14 @@ interface SaaTokenProvider {
      * Request an operator token using the device's TS.43 credential manager.
      *
      * @param activity The activity context required to present any system UI.
-     * @param credentialAuthorizationJwt The JWT from [VpMeta.credentialAuthorizationJwt].
+     * @param requestJson The complete OpenID4VP `requestJson` to pass to the
+     *   Android `DigitalCredentialManager` API. Build this with
+     *   [buildTs43CredentialRequestJson].
      * @param callback Invoked on the main thread with the token or an error.
      */
     fun requestToken(
         activity: Activity,
-        credentialAuthorizationJwt: String,
+        requestJson: String,
         callback: (token: String?, error: Exception?) -> Unit
     )
 
