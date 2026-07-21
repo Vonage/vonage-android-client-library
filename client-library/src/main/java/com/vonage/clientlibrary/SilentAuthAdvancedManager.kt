@@ -132,16 +132,8 @@ class SilentAuthAdvancedManager(
                 when {
                     token != null -> {
                         debugLog("Token received (${token.toByteArray(Charsets.UTF_8).size} bytes)")
-                        if (token.toByteArray(Charsets.UTF_8).size > MAX_TOKEN_BYTES) {
-                            errorLog("Token exceeds 5 KB limit")
-                            dispatch(callback, SaaResult.Error(
-                                SaaErrorCode.TOKEN_TOO_LARGE,
-                                "Operator token exceeds the 5 KB size limit"
-                            ))
-                        } else {
-                            debugLog("SAA completed successfully")
-                            dispatch(callback, SaaResult.Success(token))
-                        }
+                        debugLog("SAA completed successfully")
+                        dispatch(callback, SaaResult.Success(token))
                     }
                     error != null -> {
                         errorLog("Token provider error: ${error.javaClass.simpleName}: ${error.message}")
@@ -180,10 +172,6 @@ class SilentAuthAdvancedManager(
     ) {
         if (token.isNullOrBlank()) {
             dispatch(callback, SaaResult.Error(SaaErrorCode.CANCELLED, "No token returned from carrier app"))
-            return
-        }
-        if (token.toByteArray(Charsets.UTF_8).size > MAX_TOKEN_BYTES) {
-            dispatch(callback, SaaResult.Error(SaaErrorCode.TOKEN_TOO_LARGE, "Operator token exceeds the 5 KB size limit"))
             return
         }
         dispatch(callback, SaaResult.Success(token))
@@ -271,9 +259,6 @@ class SilentAuthAdvancedManager(
 
     companion object {
         private const val TAG = "VonageSAA"
-
-        /** Maximum permitted operator token size in bytes (5 KB). */
-        const val MAX_TOKEN_BYTES = 5 * 1024
 
         /** Intent extra key for the appInfoJwt passed to the carrier deep-link app. */
         const val EXTRA_APP_INFO_JWT = "com.vonage.clientlibrary.EXTRA_APP_INFO_JWT"

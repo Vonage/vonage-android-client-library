@@ -207,7 +207,6 @@ override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) 
 |---|---|
 | `UNSUPPORTED_NETWORK` | Device or carrier does not support TS.43. No deep-link fallback available. |
 | `MALFORMED_PAYLOAD` | The `sim_based_authz_data` payload is missing required fields. |
-| `TOKEN_TOO_LARGE` | The operator token exceeds the 5 KB size limit. |
 | `CANCELLED` | The credential request was cancelled by the user or system. |
 | `UNKNOWN` | An unexpected error occurred. |
 

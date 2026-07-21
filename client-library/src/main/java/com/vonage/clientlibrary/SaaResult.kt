@@ -46,8 +46,6 @@ enum class SaaErrorCode {
     UNSUPPORTED_NETWORK,
     /** The `sim_based_authz_data` payload is missing required fields or is malformed. */
     MALFORMED_PAYLOAD,
-    /** The operator token returned by the carrier exceeds the 5 KB size limit. */
-    TOKEN_TOO_LARGE,
     /** The OS-level credential request was cancelled by the user or system. */
     CANCELLED,
     /** An unexpected error occurred. */

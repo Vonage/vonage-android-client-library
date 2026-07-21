@@ -441,23 +441,6 @@ class SilentAuthAdvancedManagerTest {
     }
 
     @Test
-    fun `native path returns TOKEN_TOO_LARGE when token exceeds 5KB`() {
-        val oversizedToken = "x".repeat(SilentAuthAdvancedManager.MAX_TOKEN_BYTES + 1)
-        every { mockProvider.isNativePathAvailable(any()) } returns true
-        every { mockProvider.requestToken(any(), any(), any()) } answers {
-            val callback = thirdArg<(String?, Exception?) -> Unit>()
-            callback(oversizedToken, null)
-        }
-
-        val manager = SilentAuthAdvancedManager(mockProvider)
-        var result: SaaResult? = null
-        manager.requestOperatorToken(mockActivity, makeAuthzData(phoneHint = "+15551234567")) { result = it }
-
-        val error = result as SaaResult.Error
-        assertEquals(SaaErrorCode.TOKEN_TOO_LARGE, error.code)
-    }
-
-    @Test
     fun `native path returns UNKNOWN error when provider returns null token and null error`() {
         every { mockProvider.isNativePathAvailable(any()) } returns true
         every { mockProvider.requestToken(any(), any(), any()) } answers {
@@ -552,17 +535,6 @@ class SilentAuthAdvancedManagerTest {
 
         val error = result as SaaResult.Error
         assertEquals(SaaErrorCode.CANCELLED, error.code)
-    }
-
-    @Test
-    fun `handleDeepLinkResult returns TOKEN_TOO_LARGE for oversized token`() {
-        val oversizedToken = "x".repeat(SilentAuthAdvancedManager.MAX_TOKEN_BYTES + 1)
-        val manager = SilentAuthAdvancedManager(mockProvider)
-        var result: SaaResult? = null
-        manager.handleDeepLinkResult(oversizedToken) { result = it }
-
-        val error = result as SaaResult.Error
-        assertEquals(SaaErrorCode.TOKEN_TOO_LARGE, error.code)
     }
 
     // ------------------------------------------------------------------

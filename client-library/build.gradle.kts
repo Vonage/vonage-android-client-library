@@ -1,6 +1,6 @@
 import com.vanniktech.maven.publish.AndroidSingleVariantLibrary
 
-val libraryVersion = "1.3.0-alpha07"
+val libraryVersion = "1.3.0-alpha08"
 
 plugins {
     id("com.android.library")
