@@ -650,3 +650,57 @@ class SilentAuthAdvancedManagerTest {
         assertEquals(SaaErrorCode.UNKNOWN, error.code)
     }
 }
+
+@OptIn(ExperimentalSaaApi::class)
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28], manifest = Config.NONE)
+class OperatorTokenExtractionTest {
+
+    // ------------------------------------------------------------------
+    // extractOperatorToken — response-shape handling
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `virtual operator shape returns the flat token field`() {
+        val token = extractOperatorToken("""{"token":"eyJ0b2tlbiI6InRlc3QifQ"}""")
+        assertEquals("eyJ0b2tlbiI6InRlc3QifQ", token)
+    }
+
+    @Test
+    fun `flat token is trimmed of surrounding whitespace before parsing`() {
+        val token = extractOperatorToken("""  {"token":"abc123"}  """)
+        assertEquals("abc123", token)
+    }
+
+    @Test
+    fun `real dc_api vp_token response is forwarded verbatim`() {
+        // A real carrier returns the full OpenID4VP response with no flat
+        // `token` field; the whole response must be forwarded unchanged.
+        val response = """{"vp_token":{"gnp":"eyJhbGciOiJSUzI1NiJ9.presentation.sig"}}"""
+        val token = extractOperatorToken(response)
+        assertEquals(response, token)
+    }
+
+    @Test
+    fun `object with empty token field falls back to forwarding verbatim`() {
+        val response = """{"token":"","vp_token":{"gnp":"abc"}}"""
+        val token = extractOperatorToken(response)
+        assertEquals(response, token)
+    }
+
+    @Test
+    fun `non-json response is forwarded verbatim as a last resort`() {
+        val token = extractOperatorToken("raw-opaque-operator-token")
+        assertEquals("raw-opaque-operator-token", token)
+    }
+
+    @Test
+    fun `blank response returns null`() {
+        assertNull(extractOperatorToken("   "))
+    }
+
+    @Test
+    fun `empty response returns null`() {
+        assertNull(extractOperatorToken(""))
+    }
+}

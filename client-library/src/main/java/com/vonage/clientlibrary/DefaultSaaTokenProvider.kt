@@ -8,6 +8,7 @@ import androidx.annotation.VisibleForTesting
 import androidx.core.content.ContextCompat
 import androidx.credentials.CredentialManager
 import androidx.credentials.CredentialManagerCallback
+import androidx.credentials.DigitalCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.GetCredentialResponse
 import androidx.credentials.GetDigitalCredentialOption
@@ -15,6 +16,7 @@ import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.GetCredentialException
 import androidx.credentials.exceptions.GetCredentialUnsupportedException
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 
 /**
@@ -72,43 +74,51 @@ internal class DefaultSaaTokenProvider : SaaTokenProvider {
                 executor = ContextCompat.getMainExecutor(activity),
                 callback = object : CredentialManagerCallback<GetCredentialResponse, GetCredentialException> {
                     override fun onResult(result: GetCredentialResponse) {
+                        val credential = result.credential
                         if (debug) {
                             Log.d(TAG, "┌────── CredentialManager Response ─────────────────────")
-                            Log.d(TAG, "│ credential.type: ${result.credential.type}")
-                            Log.d(TAG, "│ credential.data keys: ${result.credential.data.keySet()}")
+                            Log.d(TAG, "│ credential.type: ${credential.type}")
+                            Log.d(TAG, "│ credential.data keys: ${credential.data.keySet()}")
                         }
-                        val credentialJson = result.credential.data.getString("credentialJson")
-                        if (debug) Log.d(TAG, "│ credentialJson: $credentialJson")
-                        if (credentialJson != null) {
-                            try {
-                                val token = JSONObject(credentialJson).optStringOrNull("token")
-                                if (!token.isNullOrEmpty()) {
-                                    if (debug) {
-                                        Log.d(TAG, "│ token: ${token.take(50)}... (${token.length} chars)")
-                                        Log.d(TAG, "└──────────────────────────────────────────────────────")
-                                    }
-                                    callback(token, null)
-                                } else {
-                                    if (debug) {
-                                        Log.e(TAG, "│ ERROR: Token not found in credentialJson")
-                                        Log.e(TAG, "└──────────────────────────────────────────────────────")
-                                    }
-                                    callback(null, IllegalStateException("Token not found in credential response"))
-                                }
-                            } catch (e: Exception) {
-                                if (debug) {
-                                    Log.e(TAG, "│ ERROR parsing credentialJson: ${e.message}")
-                                    Log.e(TAG, "└──────────────────────────────────────────────────────")
-                                }
-                                callback(null, e)
-                            }
-                        } else {
+
+                        // Read the response the supported way. The androidx
+                        // DigitalCredential type exposes the response JSON via its
+                        // `credentialJson` property; the backing Bundle key is an
+                        // internal androidx constant, NOT the literal string
+                        // "credentialJson", so reading the Bundle by that name
+                        // returns null on real devices. We keep the raw-key read
+                        // only as a last-resort fallback for older/mocked responses.
+                        val credentialJson: String? =
+                            (credential as? DigitalCredential)?.credentialJson
+                                ?: credential.data.getString("credentialJson")
+
+                        if (credentialJson.isNullOrBlank()) {
                             if (debug) {
-                                Log.e(TAG, "│ ERROR: credentialJson key not present in response data")
+                                Log.e(TAG, "│ ERROR: no credentialJson in response " +
+                                    "(type=${credential.type}, keys=${credential.data.keySet()})")
                                 Log.e(TAG, "└──────────────────────────────────────────────────────")
                             }
                             callback(null, IllegalStateException("credentialJson not present in response"))
+                            return
                         }
+
+                        if (debug) Log.d(TAG, "│ credentialJson: $credentialJson")
+
+                        val token = extractOperatorToken(credentialJson)
+                        if (token.isNullOrEmpty()) {
+                            if (debug) {
+                                Log.e(TAG, "│ ERROR: could not extract an operator token from credentialJson")
+                                Log.e(TAG, "└──────────────────────────────────────────────────────")
+                            }
+                            callback(null, IllegalStateException("Token not found in credential response"))
+                            return
+                        }
+
+                        if (debug) {
+                            Log.d(TAG, "│ token: ${token.take(50)}... (${token.length} chars)")
+                            Log.d(TAG, "└──────────────────────────────────────────────────────")
+                        }
+                        callback(token, null)
                     }
 
                     override fun onError(e: GetCredentialException) {
@@ -129,6 +139,51 @@ internal class DefaultSaaTokenProvider : SaaTokenProvider {
 
     companion object {
         private const val TAG = "VonageSAA"
+    }
+}
+
+/**
+ * Extracts the operator token to forward to `POST /v2/verify/{request_id}` from
+ * the digital credential response JSON returned by the Android
+ * `DigitalCredentialManager` API.
+ *
+ * The response shape differs by operator:
+ *  - The Vonage **virtual operator** (and earlier mocked responses) return a
+ *    simplified object: `{ "token": "<operator-token>" }`.
+ *  - **Real carriers** return the full OpenID4VP `dc_api` response (for example
+ *    an object containing a `vp_token`). There is no flat `token` field to peel
+ *    off; the presentation itself is what must reach Vonage.
+ *
+ * Strategy, in order:
+ *  1. If the response is a JSON object with a non-empty top-level `token`
+ *     string, return that string (virtual operator + backward compatibility).
+ *  2. Otherwise forward the entire `credentialJson` response verbatim so the
+ *     backend can submit the presentation to Vonage unchanged.
+ *  3. Return `null` only when there is nothing usable to forward.
+ *
+ * NOTE: the exact value Vonage expects in the `token` field of
+ * `POST /v2/verify/{request_id}` for real carriers should be confirmed against
+ * the Verify API contract. This function intentionally forwards the full
+ * response rather than dropping data, which is the safe default.
+ *
+ * Not `internal`-only for testing convenience: exposed behind
+ * [ExperimentalSaaApi] and [VisibleForTesting] like
+ * [buildTs43CredentialRequestJson].
+ *
+ * @param credentialJson The raw `credentialJson` from the digital credential.
+ * @return The token/response to forward, or `null` if nothing usable is present.
+ */
+@ExperimentalSaaApi
+@VisibleForTesting
+fun extractOperatorToken(credentialJson: String): String? {
+    val trimmed = credentialJson.trim()
+    if (trimmed.isEmpty()) return null
+    return try {
+        val direct = JSONObject(trimmed).optStringOrNull("token")
+        if (!direct.isNullOrEmpty()) direct else trimmed
+    } catch (e: JSONException) {
+        // Not a JSON object we can inspect — forward verbatim as a last resort.
+        trimmed
     }
 }
 
