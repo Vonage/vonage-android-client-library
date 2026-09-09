@@ -1,0 +1,19 @@
+client-library/src/test/java/com/vonage/clientlibrary/network/LoggingSuppressionTest.kt
+  s_39f6bdb1263919::t_ce1dd201d84e91 1-112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "880383dae09902f96df35cba0fe84b05d7a2f584",
+  "prompts": {},
+  "sessions": {
+    "s_39f6bdb1263919": {
+      "agent_id": {
+        "tool": "kiro",
+        "id": "sess_1fe6a080-39b0-4fe2-b620-36c457a879f9",
+        "model": "auto"
+      },
+      "human_author": "Chris Tankersley <chris@ctankersley.com>"
+    }
+  }
+}
