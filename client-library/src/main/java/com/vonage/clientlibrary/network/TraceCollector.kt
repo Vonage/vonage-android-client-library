@@ -62,7 +62,10 @@ data class TraceInfo(val trace: String, val debugInfo: DebugInfo)
 
 class DebugInfo {
     private val bufferMap by lazy { mutableMapOf<String, String>() }
-    private var consoleLogsEnabled = true
+    // Off by default so SDK logs never leak in release/non-debuggable builds (issue #24).
+    // Enabled only when the host app is debuggable, wired at SDK init via
+    // TraceCollector.shouldLogDebugInfoToConsole(isDebuggable).
+    private var consoleLogsEnabled = false
     private var collectionEnabled = false
 
     private val dateUtils: DateUtils by lazy {

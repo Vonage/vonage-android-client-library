@@ -44,6 +44,12 @@ internal class CellularNetworkManager(context: Context) : NetworkManager {
 
     private val tracer = TraceCollector.instance
 
+    init {
+        // Gate SDK console logging on the host app's debuggable flag (issue #24).
+        // Release/non-debuggable builds suppress all console output; debuggable builds emit it.
+        tracer.shouldLogDebugInfoToConsole(isDebuggable)
+    }
+
     override fun getCellularStatus(): CellularStatus {
         return when {
             isCellularActiveNetwork() -> CellularStatus.Available
