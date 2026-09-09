@@ -1,0 +1,29 @@
+client-library/build.gradle.kts
+  s_39f6bdb1263919::t_990c06cb4e5574 3
+client-library/src/main/java/com/vonage/clientlibrary/network/CellularNetworkManager.kt
+  s_39f6bdb1263919::t_848767b54ca73a 47-52
+client-library/src/test/java/com/vonage/clientlibrary/network/CellularNetworkManagerLoggingTest.kt
+  s_39f6bdb1263919::t_78a195c2c5b191 1-71
+README.md
+  s_39f6bdb1263919::t_975b29369094de 13
+client-library/src/test/java/com/vonage/clientlibrary/network/DebugInfoTest.kt
+  s_39f6bdb1263919::t_10a063c8b4305e 1-62
+client-library/src/main/java/com/vonage/clientlibrary/network/TraceCollector.kt
+  s_39f6bdb1263919::t_de7efdd4e9378f 65-68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "85ae714dcf5315b9a799e593181ec13477f0faae",
+  "prompts": {},
+  "sessions": {
+    "s_39f6bdb1263919": {
+      "agent_id": {
+        "tool": "kiro",
+        "id": "sess_1fe6a080-39b0-4fe2-b620-36c457a879f9",
+        "model": "auto"
+      },
+      "human_author": "Chris Tankersley <chris@ctankersley.com>"
+    }
+  }
+}
