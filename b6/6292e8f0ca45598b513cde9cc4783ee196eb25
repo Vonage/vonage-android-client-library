@@ -1,0 +1,19 @@
+README.md
+  s_fa5488894b4661::t_66c2220a5a7f16 14,17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b66292e8f0ca45598b513cde9cc4783ee196eb25",
+  "prompts": {},
+  "sessions": {
+    "s_fa5488894b4661": {
+      "agent_id": {
+        "tool": "kiro",
+        "id": "sess_d6b5e71f-b84e-44e6-8d83-ffbef1b22e0d",
+        "model": "auto"
+      },
+      "human_author": "Chris Tankersley <chris@ctankersley.com>"
+    }
+  }
+}
