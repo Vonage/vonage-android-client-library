@@ -1,0 +1,21 @@
+scripts/bump-version.sh
+  s_fa5488894b4661::t_621a3062d94859 1-84
+README.md
+  s_fa5488894b4661::t_9d07f4ef4d2095 17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "816f8f8291f0121a6086ca339ab815f2770b0139",
+  "prompts": {},
+  "sessions": {
+    "s_fa5488894b4661": {
+      "agent_id": {
+        "tool": "kiro",
+        "id": "sess_d6b5e71f-b84e-44e6-8d83-ffbef1b22e0d",
+        "model": "auto"
+      },
+      "human_author": "Chris Tankersley <chris@ctankersley.com>"
+    }
+  }
+}
