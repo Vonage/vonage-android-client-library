@@ -616,7 +616,9 @@ class ClientSocketTest {
     }
 
     @Test
-    fun `open omits Connection close on GET request so the socket can be kept alive`() {
+    fun `open requests keep-alive explicitly on GET requests`() {
+        // Omitting "Connection: close" is enough for HTTP/1.1, but an HTTP/1.0 peer only keeps the
+        // socket open when the client sends the token, so assert it is actually present.
         val outputStream = ByteArrayOutputStream()
         every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
         every { mockSSLSocket.getOutputStream() } returns outputStream
@@ -629,6 +631,7 @@ class ClientSocketTest {
         cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         val sentRequest = outputStream.toString(Charsets.UTF_8.name())
+        assertTrue("GET must request keep-alive: $sentRequest", sentRequest.contains("Connection: keep-alive"))
         assertFalse("GET request must not force Connection: close", sentRequest.contains("Connection: close"))
     }
 
@@ -1130,6 +1133,125 @@ class ClientSocketTest {
 
         assertFalse("Should not contain error: $result", result.has("error"))
         assertEquals(205, result.getInt("http_status"))
+    }
+
+    @Test
+    fun `open discards interim response metadata before parsing the final response`() {
+        // An interim response may carry headers. Leaving its Content-Length and Location active
+        // would frame the final response with the wrong length and route it to the interim target.
+        val interim = (
+            "HTTP/1.1 103 Early Hints\r\n" +
+            "Content-Length: 9999\r\n" +
+            "Location: https://other.example.com/wrong\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(interim + httpResponse(200, body = """{"ok":true}"""))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        // A second connection would mean the interim Location was followed as a redirect.
+        verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open rejects a 101 protocol upgrade`() {
+        // After 101 the stream belongs to another protocol. This client never requests an upgrade,
+        // so continuing to parse would read non-HTTP bytes as headers or block until the deadline.
+        stubResponse((
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "\r\n" +
+            "\u0081\u0085not-http-bytes"
+        ).toByteArray(Charsets.UTF_8))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open does not treat x-chunked as chunked encoding`() {
+        // "x-chunked" is a different transfer-coding. A substring match would send this body into
+        // the chunk decoder, which would reject or desynchronise an otherwise parseable response.
+        val body = """{"ok":true}"""
+        stubResponse((
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Transfer-Encoding: x-chunked\r\n" +
+            "Content-Length: ${body.toByteArray(Charsets.UTF_8).size}\r\n" +
+            "\r\n" +
+            body
+        ).toByteArray(Charsets.UTF_8))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open drains a huge non-JSON response body without retaining it`() {
+        // Only JSON bodies are surfaced, so a non-JSON body must be drained in constant memory
+        // rather than buffered and then discarded.
+        val bodyLength = 1_500_000_000L
+        val header = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/html\r\n" +
+            "Content-Length: $bodyLength\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns
+            LargeBodyInputStream(header, bodyLength, ByteArray(0))
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals(200, result.getInt("http_status"))
+        assertFalse("A non-JSON body must not be surfaced", result.has("response_body"))
+    }
+
+    @Test
+    fun `open limits the reuse probe timeout so budget remains for a retry`() {
+        // A half-open socket can blackhole packets instead of returning EOF. Spending the whole
+        // deadline on the reuse attempt would leave nothing for the retry on a fresh connection.
+        val timeouts = mutableListOf<Int>()
+        val redirectResponse = (
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns
+            ByteArrayInputStream(redirectResponse + httpResponse(200, body = """{"ok":true}"""))
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+        every { mockSSLSocket.soTimeout = any() } answers { timeouts.add(firstArg()) }
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue("Expected a connect timeout and a reuse probe timeout: $timeouts", timeouts.size >= 2)
+        val connectTimeout = timeouts.first()
+        val probeTimeout = timeouts.last()
+        assertTrue(
+            "Reuse probe must not consume the whole deadline (connect=$connectTimeout, probe=$probeTimeout)",
+            probeTimeout <= connectTimeout / 2 + 1_000
+        )
     }
 
     @Test
