@@ -64,8 +64,12 @@ internal class ClientSocket constructor(
                     attempt += 1
 
                     val remainingMs = deadline - System.currentTimeMillis()
-                    if (remainingMs <= 0)
+                    if (remainingMs <= 0) {
+                        // A pending same-authority redirect leaves the socket open for a hop that
+                        // will never run, so close it here or every timeout leaks a socket.
+                        if (connectedAuthority != null) runCatching { stopConnection() }
                         return convertError("sdk_timeout_error", "Operation deadline exceeded")
+                    }
 
                     // Reuse the existing TCP+TLS connection for same-host redirects (DEVX-11219).
                     // Open a new connection when the authority (host:port) changes or on the first
@@ -77,9 +81,12 @@ internal class ClientSocket constructor(
                         startConnection(nurl, remainingMs)
                         connectedAuthority = nurlAuthority
                     } else {
-                        // Refresh soTimeout to reflect remaining deadline budget
-                        socket.soTimeout = remainingMs.coerceAtLeast(1L).toInt()
-                        tracer.addDebug(Log.DEBUG, TAG, "Reusing connection, updated timeout to ${socket.soTimeout}ms")
+                        // Bound the reuse attempt to part of the remaining budget. A half-open
+                        // connection can silently blackhole packets instead of returning EOF, and
+                        // spending the whole deadline here would leave nothing for the retry below —
+                        // making stale-connection recovery work only for immediate closes.
+                        socket.soTimeout = (remainingMs / REUSE_PROBE_BUDGET_DIVISOR).coerceAtLeast(1L).toInt()
+                        tracer.addDebug(Log.DEBUG, TAG, "Reusing connection, probe timeout ${socket.soTimeout}ms")
                     }
 
                     // Request keep-alive so the server leaves the TCP+TLS socket open for a
@@ -374,9 +381,10 @@ internal class ClientSocket constructor(
         }
         if (cs.length > 1) cmd.append("Cookie: " + cs.toString() + "$CRLF")
 
-        // For same-host keep-alive chains, omit Connection: close so the server
-        // keeps the TCP+TLS socket open for the next hop (DEVX-11219).
-        if (!keepAlive) cmd.append("Connection: close$CRLF")
+        // For same-host keep-alive chains, ask for persistence explicitly (DEVX-11219). HTTP/1.1 is
+        // persistent by default, but an HTTP/1.0 peer only keeps the socket open when both sides send
+        // the token — omitting "Connection: close" alone is not enough for those gateways.
+        if (keepAlive) cmd.append("Connection: keep-alive$CRLF") else cmd.append("Connection: close$CRLF")
         cmd.append(CRLF)
         return cmd.toString()
     }
@@ -485,6 +493,18 @@ internal class ClientSocket constructor(
                 tracer.addTrace(line + "\n")
                 when {
                     line.startsWith("HTTP/") -> {
+                        if (status in 100..199) {
+                            // Advancing past an interim response. Its per-response metadata must not
+                            // frame, route or annotate the final response; only connection-scoped
+                            // state (mustClose) carries over.
+                            contentLength = -1
+                            chunked = false
+                            type = ""
+                            redirectResult = null
+                            earlyRedirect = false
+                            peerRequestedKeepAlive = false
+                            trackingHeaders.clear()
+                        }
                         val parts = line.split(" ")
                         if (parts.size >= 2) {
                             status = parts[1].trim().toIntOrNull() ?: 0
@@ -532,7 +552,10 @@ internal class ClientSocket constructor(
                         }
                     }
                     line.startsWith("Transfer-Encoding:", ignoreCase = true) -> {
-                        if (line.substringAfter(':').contains("chunked", ignoreCase = true)) {
+                        // Compare codings as exact tokens: a substring match would send
+                        // "x-chunked" — a different transfer-coding — into the chunk decoder.
+                        val codings = line.substringAfter(':').split(',').map { it.trim() }
+                        if (codings.any { it.equals("chunked", ignoreCase = true) }) {
                             chunked = true
                             if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Transfer-Encoding: chunked")
                         }
@@ -562,9 +585,15 @@ internal class ClientSocket constructor(
                         }
                     }
                     line.isEmpty() && status in 100..199 -> {
-                        // An informational response has no body and is followed by the final
-                        // response on the same connection. Keep parsing rather than treating it
-                        // as the completed request.
+                        // 101 hands the socket to another protocol. This client never requests an
+                        // upgrade, so whatever follows is not HTTP: parsing it would consume
+                        // upgraded-protocol bytes as headers or block until the deadline.
+                        if (status == 101) {
+                            throw IOException("Unexpected protocol upgrade (101 Switching Protocols)")
+                        }
+                        // Any other informational response has no body and precedes the final
+                        // response on this connection. Keep parsing rather than treating it as
+                        // the completed request.
                         tracer.addTrace("Informational response received; awaiting final response\n")
                     }
                     line.isEmpty() && earlyRedirect -> {
@@ -591,26 +620,29 @@ internal class ClientSocket constructor(
                     }
                     line.isEmpty() -> {
                         // End of headers on a non-redirect response. Read the body deterministically
-                        // so a kept-alive socket never blocks waiting for EOF (DEVX-11219). A body
-                        // with no Content-Length and no chunked framing ends at connection close, so
-                        // read to EOF — a conforming keep-alive server always supplies framing.
-                        // Only JSON content types are surfaced as a body; anything else is consumed
-                        // to keep the stream framed but not returned, matching prior behaviour.
-                        val rawBody = when {
-                            !responseCanHaveBody(status) -> ""
-                            chunked -> readChunkedBody(rawInput)
-                            contentLength >= 0 -> readFixedLengthBody(rawInput, contentLength)
+                        // so a kept-alive socket never blocks waiting for EOF (DEVX-11219).
+                        //
+                        // Only JSON content types are surfaced to the caller, so decide read-versus-
+                        // drain *before* consuming: buffering a peer-controlled non-JSON body just to
+                        // discard it could exhaust the heap. Drains run in constant memory.
+                        val keepBody = isJsonType(type)
+                        when {
+                            !responseCanHaveBody(status) -> {}
+                            chunked ->
+                                if (keepBody) bodyBuilder.append(readChunkedBody(rawInput))
+                                else drainChunkedBody(rawInput)
+                            contentLength >= 0 ->
+                                if (keepBody) bodyBuilder.append(readFixedLengthBody(rawInput, contentLength))
+                                else drainFixedLengthBody(rawInput, contentLength)
                             else -> {
                                 // No framing: the body is delimited by connection close, so once we
                                 // reach EOF this socket is finished and must not be reused.
                                 mustClose = true
-                                readMultipleBytes(rawInput, 65536) ?: ""
+                                if (keepBody) bodyBuilder.append(readMultipleBytes(rawInput, 65536) ?: "")
+                                else drainToEndOfStream(rawInput)
                             }
                         }
-                        if (isJsonType(type)) {
-                            bodyBuilder.append(rawBody)
-                            bodyBegin = bodyBuilder.isNotEmpty()
-                        }
+                        bodyBegin = bodyBuilder.isNotEmpty()
                         if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Body complete - ${DateUtils.now()}\n")
                         break
                     }
@@ -722,6 +754,14 @@ internal class ClientSocket constructor(
             if (n <= 0) throw IOException("Unexpected EOF while reading $length-byte response body")
             sink?.write(buf, 0, n)
             remaining -= n
+        }
+    }
+
+    /** Consumes a close-delimited body without retaining it. */
+    private fun drainToEndOfStream(stream: InputStream) {
+        val buf = ByteArray(8192)
+        while (stream.read(buf, 0, buf.size) != -1) {
+            // Discard: the caller does not surface this body.
         }
     }
 
@@ -861,6 +901,9 @@ internal class ClientSocket constructor(
         private const val PORT_443 = 443
         private const val CRLF = "\r\n"
         private const val GLOBAL_DEADLINE_MS: Long = 30_000
+        // A reused socket gets this fraction of the remaining deadline, leaving the rest for a retry
+        // on a fresh connection if the reused one turns out to be half-open.
+        private const val REUSE_PROBE_BUDGET_DIVISOR: Long = 2
         private val HTTP_STATUS_RANGE = 100..599
 
         // Operator-injected tracking headers to capture and log for troubleshooting.
