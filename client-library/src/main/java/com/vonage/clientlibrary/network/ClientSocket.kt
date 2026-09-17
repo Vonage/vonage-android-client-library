@@ -51,49 +51,74 @@ internal class ClientSocket constructor(
             val nurl = redirectURL ?: url
             tracer.addDebug(Log.DEBUG, TAG, "Requesting: $nurl")
 
-            val remainingMs = deadline - System.currentTimeMillis()
-            if (remainingMs <= 0)
-                return convertError("sdk_timeout_error", "Operation deadline exceeded")
-
             val nurlAuthority = "${nurl.host}:${if (nurl.port > 0) nurl.port else PORT_443}"
+            // Captured before the attempt loop so a retry resends the same request.
+            val hopHeaders = if (redirectCount == 1) headers else null
+            val hopOperator = if (redirectCount == 1) operator else null
+            val hopCookies = if (redirectCount == 1) null else result?.getCookies()
 
             try {
-                // Reuse the existing TCP+TLS connection for same-host redirects (DEVX-11219).
-                // Open a new connection when the authority (host:port) changes or on the first request.
-                //
-                // A matching authority is necessary but not sufficient: the socket is only reusable
-                // if the previous hop actually left it open. When we send "Connection: close" the
-                // server tears the connection down after responding, so writing the next hop into
-                // that socket reads EOF — which surfaced as a phantom {"http_status": 0}.
-                val reusingConnection = (nurlAuthority == connectedAuthority) && connectionKeptAlive
-                if (!reusingConnection) {
-                    if (connectedAuthority != null) stopConnection()
-                    startConnection(nurl, remainingMs)
-                    connectedAuthority = nurlAuthority
-                } else {
-                    // Refresh soTimeout to reflect remaining deadline budget
-                    socket.soTimeout = remainingMs.coerceAtLeast(1L).toInt()
-                    tracer.addDebug(Log.DEBUG, TAG, "Reusing connection, updated timeout to ${socket.soTimeout}ms")
+                var hopResult: ResultHandler? = null
+                var attempt = 0
+                while (true) {
+                    attempt += 1
+
+                    val remainingMs = deadline - System.currentTimeMillis()
+                    if (remainingMs <= 0)
+                        return convertError("sdk_timeout_error", "Operation deadline exceeded")
+
+                    // Reuse the existing TCP+TLS connection for same-host redirects (DEVX-11219).
+                    // Open a new connection when the authority (host:port) changes or on the first
+                    // request. A matching authority is necessary but not sufficient: the socket is
+                    // only reusable if the previous hop left it open and fully framed.
+                    val reusingConnection = (nurlAuthority == connectedAuthority) && connectionKeptAlive
+                    if (!reusingConnection) {
+                        if (connectedAuthority != null) stopConnection()
+                        startConnection(nurl, remainingMs)
+                        connectedAuthority = nurlAuthority
+                    } else {
+                        // Refresh soTimeout to reflect remaining deadline budget
+                        socket.soTimeout = remainingMs.coerceAtLeast(1L).toInt()
+                        tracer.addDebug(Log.DEBUG, TAG, "Reusing connection, updated timeout to ${socket.soTimeout}ms")
+                    }
+
+                    // Request keep-alive so the server leaves the TCP+TLS socket open for a
+                    // following same-authority redirect. Whether we then reuse it is decided by
+                    // connectionKeptAlive below.
+                    val attemptResult = runCatching {
+                        sendCommand(nurl, hopHeaders, hopOperator, hopCookies, requestId, keepAlive = true)
+                    }
+                    val attemptStatus = attemptResult.getOrNull()?.getHttpStatus()
+                    if (attemptResult.isSuccess && attemptStatus != null && attemptStatus in HTTP_STATUS_RANGE) {
+                        hopResult = attemptResult.getOrThrow()
+                        break
+                    }
+
+                    // A peer may close an idle kept-alive socket at any time, so a reused
+                    // connection that fails to answer is not an error yet. Drop it and resend once
+                    // on a fresh connection; open() only issues GETs, so replaying is safe.
+                    if (reusingConnection && attempt == 1) {
+                        tracer.addDebug(Log.DEBUG, TAG, "Reused connection closed by peer; retrying on a new connection")
+                        tracer.addTrace("Reused connection closed by peer; retrying on a new connection\n")
+                        runCatching { stopConnection() }
+                        connectedAuthority = null
+                        connectionKeptAlive = false
+                        continue
+                    }
+
+                    // A fresh connection failing is a real error; report it as before.
+                    attemptResult.exceptionOrNull()?.let { throw it }
+                    hopResult = attemptResult.getOrNull()
+                    break
                 }
+                result = hopResult
 
-                // Request keep-alive on every hop so the server leaves the TCP+TLS socket open for
-                // a following same-authority redirect (DEVX-11219). Whether we actually reuse it is
-                // still gated by connectionKeptAlive below: we only reuse when the peer did not send
-                // "Connection: close" and the response body was fully framed (drained by
-                // Content-Length or chunked), so we never write into a socket being torn down.
-                val keepAlive = true
+                // This hop leaves the socket usable for the next one only if we got a response and
+                // the peer did not require a close.
+                connectionKeptAlive = result != null && result.mustCloseConnection != true
 
-                result = if (redirectCount == 1)
-                    sendCommand(nurl, headers, operator, null, requestId, keepAlive = keepAlive)
-                else
-                    sendCommand(nurl, null, null, result?.getCookies(), requestId, keepAlive = keepAlive)
-
-                // This hop leaves the socket usable for the next one only if we asked to keep it
-                // alive and the peer did not ask us to close.
-                connectionKeptAlive = keepAlive && result?.mustCloseConnection != true
-
-                // Check if the result signals we must close (no Content-Length drain, or the peer
-                // sent "Connection: close")
+                // Check if the result signals we must close (unframed body, legacy HTTP version, or
+                // the peer sent "Connection: close")
                 if (result?.mustCloseConnection == true) {
                     stopConnection()
                     connectedAuthority = null
@@ -434,6 +459,10 @@ internal class ClientSocket constructor(
         var chunked: Boolean = false
         var earlyRedirect: Boolean = false
         var mustClose: Boolean = false
+        // HTTP/1.0 and earlier are not persistent unless the peer opts in with
+        // "Connection: keep-alive". Track both so reuse is never assumed.
+        var legacyHttpVersion: Boolean = false
+        var peerRequestedKeepAlive: Boolean = false
         val bodyBuilder = StringBuilder()  // DEVX-11223: avoid O(n²) string concat
         val cookies: ArrayList<HttpCookie> = ArrayList()
         if (existingCookies != null) cookies.addAll(existingCookies)
@@ -453,6 +482,10 @@ internal class ClientSocket constructor(
                             if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Status - $status")
                             tracer.addTrace("Status - $status ${DateUtils.now()}\n")
                         }
+                        val version = parts[0].trim().substringAfter('/', "")
+                        val major = version.substringBefore('.').toIntOrNull() ?: 1
+                        val minor = version.substringAfter('.', "0").toIntOrNull() ?: 0
+                        legacyHttpVersion = major < 1 || (major == 1 && minor < 1)
                     }
                     line.startsWith("Set-Cookie:", ignoreCase = true) -> {
                         val parts: List<String> = line.split("ookie:")
@@ -496,15 +529,17 @@ internal class ClientSocket constructor(
                         }
                     }
                     line.startsWith("Connection:", ignoreCase = true) -> {
-                        // The peer is telling us this is the last exchange on this socket. Honour
-                        // it, or the next hop gets written into a connection being torn down.
-                        val wantsClose = line.substringAfter(':')
-                            .split(',')
-                            .any { it.trim().equals("close", ignoreCase = true) }
-                        if (wantsClose) {
+                        // The peer is telling us whether this is the last exchange on this socket.
+                        // Honour "close", or the next hop gets written into a connection being torn
+                        // down; record "keep-alive" so a legacy response can opt into reuse.
+                        val tokens = line.substringAfter(':').split(',').map { it.trim() }
+                        if (tokens.any { it.equals("close", ignoreCase = true) }) {
                             mustClose = true
                             tracer.addDebug(Log.DEBUG, TAG, "Peer sent Connection: close")
                             tracer.addTrace("Peer sent Connection: close\n")
+                        }
+                        if (tokens.any { it.equals("keep-alive", ignoreCase = true) }) {
+                            peerRequestedKeepAlive = true
                         }
                     }
                     OPERATOR_TRACKING_HEADERS.any { line!!.startsWith(it, ignoreCase = true) } -> {
@@ -554,7 +589,12 @@ internal class ClientSocket constructor(
                             !responseCanHaveBody(status) -> ""
                             chunked -> readChunkedBody(rawInput)
                             contentLength >= 0 -> readFixedLengthBody(rawInput, contentLength)
-                            else -> readMultipleBytes(rawInput, 65536) ?: ""
+                            else -> {
+                                // No framing: the body is delimited by connection close, so once we
+                                // reach EOF this socket is finished and must not be reused.
+                                mustClose = true
+                                readMultipleBytes(rawInput, 65536) ?: ""
+                            }
                         }
                         if (isJsonType(type)) {
                             bodyBuilder.append(rawBody)
@@ -565,6 +605,13 @@ internal class ClientSocket constructor(
                     }
                 }
                 line = readHttpLine(rawInput)
+            }
+
+            // An HTTP/1.0 (or earlier) response is not persistent unless the peer explicitly asked
+            // to keep the connection alive, so a following same-host hop must not reuse this socket.
+            if (legacyHttpVersion && !peerRequestedKeepAlive) {
+                tracer.addTrace("Legacy HTTP version without keep-alive — closing connection\n")
+                mustClose = true
             }
 
             if (earlyRedirect) {
@@ -600,21 +647,21 @@ internal class ClientSocket constructor(
     /**
      * Reads one HTTP header line from the raw InputStream, stripping the trailing CRLF.
      * Returns null on EOF, empty string on a blank line (end-of-headers).
+     * Accepts a bare LF as well as CRLF: without a terminator match the parser would keep reading,
+     * and on a kept-alive socket there is no EOF to stop it, so the request would stall.
      * Bytes-accurate: no buffering ahead into the body.
      */
     private fun readHttpLine(stream: InputStream): String? {
         val sb = StringBuilder()
-        var prev = -1
         while (true) {
             val b = stream.read()
             if (b == -1) return if (sb.isEmpty()) null else sb.toString()
-            if (prev == '\r'.code && b == '\n'.code) {
-                // Drop the CR we already appended
-                if (sb.isNotEmpty()) sb.deleteCharAt(sb.length - 1)
+            if (b == '\n'.code) {
+                // Drop the CR of a CRLF pair when present.
+                if (sb.isNotEmpty() && sb[sb.length - 1] == '\r') sb.deleteCharAt(sb.length - 1)
                 return sb.toString()
             }
             sb.append(b.toChar())
-            prev = b
         }
     }
 
@@ -652,6 +699,7 @@ internal class ClientSocket constructor(
      */
     private fun readChunkedBody(stream: InputStream): String {
         val out = ByteArrayOutputStream()
+        val buf = ByteArray(8192)
         while (true) {
             val sizeLine = readHttpLine(stream)
                 ?: throw IOException("Unexpected EOF while reading chunk size")
@@ -667,14 +715,16 @@ internal class ClientSocket constructor(
                     if (trailer.isEmpty()) return out.toString(StandardCharsets.UTF_8.name())
                 }
             }
-            val buf = ByteArray(size)
-            var read = 0
-            while (read < size) {
-                val n = stream.read(buf, read, size - read)
+            // Copy the chunk through a fixed buffer. Never allocate from the advertised size: it is
+            // peer-controlled, and a bogus value would otherwise exhaust the heap with an
+            // OutOfMemoryError that our Exception handlers cannot catch.
+            var remaining = size
+            while (remaining > 0) {
+                val n = stream.read(buf, 0, minOf(buf.size, remaining))
                 if (n <= 0) throw IOException("Unexpected EOF while reading chunk data")
-                read += n
+                out.write(buf, 0, n)
+                remaining -= n
             }
-            out.write(buf)
             // A CRLF must immediately follow every chunk's data.
             if (readHttpLine(stream) != "") throw IOException("Missing chunk delimiter")
         }

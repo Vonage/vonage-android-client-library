@@ -506,6 +506,144 @@ class ClientSocketTest {
     }
 
     @Test
+    fun `open retries on a new connection when the reused socket was closed by the peer`() {
+        // A peer may close an idle kept-alive socket at any time. The redirect response invites
+        // reuse (HTTP/1.1, framed, no "Connection: close"), but the socket is then dead. That race
+        // must be recovered transparently instead of surfacing sdk_connection_error.
+        val redirectResponse = (
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+
+        // First socket serves the redirect then yields EOF; the retry must use a second socket.
+        val responses = listOf(redirectResponse, httpResponse(200, body = """{"ok":true}""")).iterator()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+            makeMockSocket(if (responses.hasNext()) responses.next() else ByteArray(0))
+        }
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        verify(exactly = 2) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertFalse("Stale reused socket must not fail the request: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open does not reuse a connection for an HTTP 1_0 response without keep-alive`() {
+        // HTTP/1.0 is not persistent unless the peer opts in, so this socket must not be reused
+        // even though the authority matches and no "Connection: close" was sent. The first socket
+        // also offers a second response: reading it would prove we wrongly reused the connection.
+        val legacyRedirect = (
+            "HTTP/1.0 301 Moved Permanently\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        val staleSocket = legacyRedirect + httpResponse(200, body = """{"from":"reused"}""")
+        val freshSocket = httpResponse(200, body = """{"from":"fresh"}""")
+
+        val responses = listOf(staleSocket, freshSocket).iterator()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+            makeMockSocket(if (responses.hasNext()) responses.next() else ByteArray(0))
+        }
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        assertEquals("fresh", result.getJSONObject("response_body").getString("from"))
+    }
+
+    @Test
+    fun `open reuses a connection for an HTTP 1_0 response that opts into keep-alive`() {
+        val legacyRedirect = (
+            "HTTP/1.0 301 Moved Permanently\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: 0\r\n" +
+            "Connection: keep-alive\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(legacyRedirect + httpResponse(200, body = """{"ok":true}"""))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open rejects an oversized chunk size without exhausting memory`() {
+        // The chunk size is peer-controlled. Allocating from it would throw OutOfMemoryError, which
+        // is an Error and would escape the SDK's Exception handling into the caller.
+        val hostileChunk = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
+            "\r\n" +
+            "7fffffff\r\n" +
+            "{}"
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(hostileChunk)
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open parses a response that terminates header lines with bare LF`() {
+        // Without CRLF the line reader used to consume the whole response as one line and relied on
+        // EOF to stop. On a kept-alive socket there is no EOF, so this would stall until timeout.
+        val body = """{"ok":true}"""
+        val bareLf = (
+            "HTTP/1.1 200 OK\n" +
+            "Content-Type: application/json\n" +
+            "Content-Length: ${body.toByteArray(Charsets.UTF_8).size}\n" +
+            "\n" +
+            body
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(bareLf)
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open completes a redirect whose body is delimited by connection close`() {
+        // A non-3xx status carrying Location, with no Content-Length and no chunked framing: the
+        // body ends at EOF, so the socket is spent and the next hop needs a fresh connection.
+        val unframed = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Type: text/html\r\n" +
+            "\r\n" +
+            "<html>redirecting</html>"
+        ).toByteArray(Charsets.UTF_8)
+
+        val responses = listOf(unframed, httpResponse(200, body = """{"ok":true}""")).iterator()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+            makeMockSocket(if (responses.hasNext()) responses.next() else ByteArray(0))
+        }
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
     fun `open does not reuse connection when redirect changes port`() {        val redirectResponse = (
             "HTTP/1.1 301 Moved Permanently\r\n" +
             "Location: https://api.example.com:8443/other\r\n" +
