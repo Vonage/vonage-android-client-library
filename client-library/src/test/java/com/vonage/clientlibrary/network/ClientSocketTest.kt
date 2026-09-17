@@ -259,30 +259,78 @@ class ClientSocketTest {
     }
 
     @Test
-    fun `open refreshes socket timeout when reusing connection for same-authority redirect`() {
-        // Same authority redirect: api.example.com:443 → api.example.com:443
-        // The code reuses the socket, so createSocket is called only once but soTimeout set twice.
+    fun `open opens a fresh connection for same-authority redirect after Connection close`() {
+        // Regression: the first hop always sends "Connection: close" (keepAlive is false on the
+        // first request), so a conforming server tears the socket down after answering. Reusing
+        // it for a same-authority redirect reads EOF, which surfaced as {"http_status": 0}.
         val redirectResponse = (
             "HTTP/1.1 301 Moved Permanently\r\n" +
             "Location: https://api.example.com/final\r\n" +
             "Content-Length: 0\r\n" +
+            "Connection: close\r\n" +
             "\r\n"
         ).toByteArray(Charsets.UTF_8)
         val finalResponse = httpResponse(200, body = """{"ok":true}""")
 
-        // Concatenate both responses into one stream to simulate server reuse
-        val combined = redirectResponse + finalResponse
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
-        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
-        every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(combined)
-        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
-        every { mockSSLSocket.port } returns 443
+        // Each connection gets its own stream. The first socket serves the redirect and then
+        // yields EOF — exactly what a server honouring "Connection: close" leaves behind. If the
+        // redirect reuses that socket it reads nothing and no status line is ever parsed.
+        val opened = mutableListOf<SSLSocket>()
+        val responses = listOf(redirectResponse, finalResponse).iterator()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+            makeMockSocket(if (responses.hasNext()) responses.next() else ByteArray(0))
+                .also { opened.add(it) }
+        }
 
         val cs = ClientSocket(mockTracer)
-        cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
 
-        // soTimeout set once on startConnection, once on reuse
-        verify(atLeast = 2) { mockSSLSocket.soTimeout = any() }
+        assertEquals("Same-host redirect must get a fresh connection", 2, opened.size)
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open reports sdk_connection_error when peer closes without responding`() {
+        // Zero bytes back: readHttpLine hits EOF on its first call, so the parse loop never runs
+        // and no status line is read. That must not leak the uninitialised status 0 into the
+        // success shape, where a caller checking for "error" would treat it as a good response.
+        stubResponse(ByteArray(0))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+        assertFalse("Must not report a phantom http_status", result.has("http_status"))
+    }
+
+    @Test
+    fun `open does not reuse connection when response sends Connection close with a body`() {
+        // A same-authority redirect that carries both a drainable body and "Connection: close".
+        // The drain succeeds, so the old mustClose heuristic (contentLength < 0) would have kept
+        // the socket; the response header has to be what forces the reconnect.
+        val body = "redirecting"
+        val redirectResponse = (
+            "HTTP/1.1 302 Found\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: ${body.length}\r\n" +
+            "Connection: close\r\n" +
+            "\r\n" +
+            body
+        ).toByteArray(Charsets.UTF_8)
+        val finalResponse = httpResponse(200, body = """{"ok":true}""")
+
+        val responses = listOf(redirectResponse, finalResponse).iterator()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+            makeMockSocket(if (responses.hasNext()) responses.next() else ByteArray(0))
+        }
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        verify(exactly = 2) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertEquals(200, result.getInt("http_status"))
     }
 
     @Test
