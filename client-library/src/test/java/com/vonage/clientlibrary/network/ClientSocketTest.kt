@@ -104,6 +104,55 @@ class ClientSocketTest {
         }
     }
 
+    /**
+     * Serves [header], then [bodyLength] generated filler bytes, then [trailer], without ever
+     * holding the body in memory. Lets a body far larger than the heap be streamed, so a drain that
+     * accumulates bytes fails with OutOfMemoryError while a true drain runs in constant memory.
+     */
+    private class LargeBodyInputStream(
+        private val header: ByteArray,
+        private val bodyLength: Long,
+        private val trailer: ByteArray
+    ) : InputStream() {
+        private var headerPos = 0
+        private var bodyPos = 0L
+        private var trailerPos = 0
+
+        override fun read(): Int {
+            if (headerPos < header.size) return header[headerPos++].toInt() and 0xFF
+            if (bodyPos < bodyLength) { bodyPos++; return FILLER.toInt() }
+            if (trailerPos < trailer.size) return trailer[trailerPos++].toInt() and 0xFF
+            return -1
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (len == 0) return 0
+            if (headerPos < header.size) {
+                val n = minOf(len, header.size - headerPos)
+                System.arraycopy(header, headerPos, b, off, n)
+                headerPos += n
+                return n
+            }
+            if (bodyPos < bodyLength) {
+                val n = minOf(len.toLong(), bodyLength - bodyPos).toInt()
+                b.fill(FILLER, off, off + n)
+                bodyPos += n
+                return n
+            }
+            if (trailerPos < trailer.size) {
+                val n = minOf(len, trailer.size - trailerPos)
+                System.arraycopy(trailer, trailerPos, b, off, n)
+                trailerPos += n
+                return n
+            }
+            return -1
+        }
+
+        private companion object {
+            const val FILLER: Byte = 'x'.code.toByte()
+        }
+    }
+
     // ------------------------------------------------------------------
     // Tests
     // ------------------------------------------------------------------
@@ -842,6 +891,245 @@ class ClientSocketTest {
         assertFalse("Should not contain error: $result", result.has("error"))
         assertEquals(200, result.getInt("http_status"))
         assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    // ------------------------------------------------------------------
+    // Drain behaviour, retry bounds, and framing edge cases
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `open drains a huge redirect body without retaining it`() {
+        // The drained body is discarded, so it must never be accumulated: buffering a
+        // peer-controlled length would exhaust the heap with an OutOfMemoryError that the SDK's
+        // Exception handling cannot catch. 1.5 GB is streamed but never held.
+        val bodyLength = 1_500_000_000L
+        val header = (
+            "HTTP/1.1 302 Found\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: $bodyLength\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns LargeBodyInputStream(
+            header,
+            bodyLength,
+            httpResponse(200, body = """{"ok":true}""")
+        )
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open retries a stale connection only once`() {
+        // The retry must be bounded: a fresh connection that also fails is a real error, not another
+        // stale-socket race, so it must not loop.
+        val redirectResponse = (
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+
+        // Socket 1: redirect then EOF. Socket 2 (the retry): EOF immediately.
+        val responses = listOf(redirectResponse, ByteArray(0)).iterator()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+            makeMockSocket(if (responses.hasNext()) responses.next() else ByteArray(0))
+        }
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        verify(exactly = 2) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open does not retry a failure on a fresh connection`() {
+        // Only a reused socket earns a retry. A fresh connection returning nothing is a genuine
+        // failure and must be reported without a second attempt.
+        stubResponse(ByteArray(0))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open uses a fresh connection when a non-redirect response sends Connection close`() {
+        // The close decision must survive the redirectResult path for every reason, not just an
+        // unframed body: here a framed 200 carrying Location also sends "Connection: close".
+        val closing = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: 0\r\n" +
+            "Connection: close\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+
+        val firstOut = ByteArrayOutputStream()
+        val firstSocket = mockk<SSLSocket>(relaxed = true)
+        every { firstSocket.getInputStream() } returns ByteArrayInputStream(closing)
+        every { firstSocket.getOutputStream() } returns firstOut
+        every { firstSocket.inetAddress } returns mockk(relaxed = true)
+        every { firstSocket.port } returns 443
+
+        val sockets = listOf(firstSocket, makeMockSocket(httpResponse(200, body = """{"ok":true}"""))).iterator()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+            if (sockets.hasNext()) sockets.next() else makeMockSocket(ByteArray(0))
+        }
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        val firstRequests = firstOut.toString(Charsets.UTF_8.name())
+        assertEquals(
+            "Closed connection must not be written to again: $firstRequests",
+            1,
+            Regex("^GET ", RegexOption.MULTILINE).findAll(firstRequests).count()
+        )
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open rejects a non-hexadecimal chunk size`() {
+        stubResponse((
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
+            "\r\n" +
+            "zz\r\n" +
+            "{}\r\n"
+        ).toByteArray(Charsets.UTF_8))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open rejects a chunk that is not followed by its delimiter`() {
+        // Chunk data must be followed by CRLF. Without that check the stream would desynchronise and
+        // the next read on a reused socket would parse garbage.
+        stubResponse((
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
+            "\r\n" +
+            "2\r\n" +
+            "{}XX" +
+            "0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open handles chunk extensions and trailer headers`() {
+        val chunked = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
+            "\r\n" +
+            "b;name=value\r\n" +
+            "{\"ok\":true}\r\n" +
+            "0\r\n" +
+            "X-Checksum: abc123\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(chunked)
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open parses a chunked body framed with bare LF`() {
+        val chunked = (
+            "HTTP/1.1 200 OK\n" +
+            "Content-Type: application/json\n" +
+            "Transfer-Encoding: chunked\n" +
+            "\n" +
+            "b\n" +
+            "{\"ok\":true}\n" +
+            "0\n" +
+            "\n"
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(chunked)
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open reads a body larger than the read buffer with multibyte characters intact`() {
+        // Exercises the multi-read loop and proves the body is decoded from bytes, not assembled
+        // per line or per read: the value spans several 8 KB reads and its byte length differs from
+        // its character length.
+        val value = "é".repeat(6000)
+        val body = """{"v":"$value"}"""
+        assertTrue("Body must exceed the read buffer", body.toByteArray(Charsets.UTF_8).size > 8192)
+        stubResponse(httpResponse(200, body = body))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(value, result.getJSONObject("response_body").getString("v"))
+    }
+
+    @Test
+    fun `open does not wait for EOF after a persistent 304 response`() {
+        val response = "HTTP/1.1 304 Not Modified\r\n\r\n".toByteArray(Charsets.UTF_8)
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns HeaderOnlyResponseInputStream(response)
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(304, result.getInt("http_status"))
+    }
+
+    @Test
+    fun `open does not wait for EOF after a persistent 205 response`() {
+        val response = "HTTP/1.1 205 Reset Content\r\n\r\n".toByteArray(Charsets.UTF_8)
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns HeaderOnlyResponseInputStream(response)
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(205, result.getInt("http_status"))
     }
 
     @Test
