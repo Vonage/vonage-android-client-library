@@ -41,6 +41,7 @@ internal class ClientSocket constructor(
         var redirectCount = 0
         var result: ResultHandler? = null
         var connectedAuthority: String? = null  // "host:port" — guards against same-host/different-port reuse
+        var connectionKeptAlive = false         // did the previous hop leave the socket open?
 
         httpLogger.logRequest("GET", url.toString(), headers, body = null)
 
@@ -58,7 +59,12 @@ internal class ClientSocket constructor(
             try {
                 // Reuse the existing TCP+TLS connection for same-host redirects (DEVX-11219).
                 // Open a new connection when the authority (host:port) changes or on the first request.
-                val reusingConnection = (nurlAuthority == connectedAuthority)
+                //
+                // A matching authority is necessary but not sufficient: the socket is only reusable
+                // if the previous hop actually left it open. When we send "Connection: close" the
+                // server tears the connection down after responding, so writing the next hop into
+                // that socket reads EOF — which surfaced as a phantom {"http_status": 0}.
+                val reusingConnection = (nurlAuthority == connectedAuthority) && connectionKeptAlive
                 if (!reusingConnection) {
                     if (connectedAuthority != null) stopConnection()
                     startConnection(nurl, remainingMs)
@@ -80,10 +86,16 @@ internal class ClientSocket constructor(
                 else
                     sendCommand(nurl, null, null, result?.getCookies(), requestId, keepAlive = keepAlive)
 
-                // Check if the redirect result signals we must close (no Content-Length drain)
+                // This hop leaves the socket usable for the next one only if we asked to keep it
+                // alive and the peer did not ask us to close.
+                connectionKeptAlive = keepAlive && result?.mustCloseConnection != true
+
+                // Check if the result signals we must close (no Content-Length drain, or the peer
+                // sent "Connection: close")
                 if (result?.mustCloseConnection == true) {
                     stopConnection()
                     connectedAuthority = null
+                    connectionKeptAlive = false
                 }
 
                 redirectURL = result?.getRedirect()
@@ -95,6 +107,7 @@ internal class ClientSocket constructor(
                      "${redirectURL!!.host}:${if (redirectURL!!.port > 0) redirectURL!!.port else PORT_443}" != connectedAuthority)) {
                     stopConnection()
                     connectedAuthority = null
+                    connectionKeptAlive = false
                 }
             } catch (ex: Exception) {
                 tracer.addDebug(Log.DEBUG, TAG, "Cannot start connection: $nurl")
@@ -103,6 +116,7 @@ internal class ClientSocket constructor(
                     runCatching { stopConnection() }
                     connectedAuthority = null
                 }
+                connectionKeptAlive = false
                 return convertError("sdk_connection_error", "ex: ".plus(ex.localizedMessage))
             }
         } while (redirectURL != null && redirectCount <= maxRedirectCount)
@@ -115,6 +129,12 @@ internal class ClientSocket constructor(
     }
 
     private fun convertResultHandler(res: ResultResponse): JSONObject {
+        // A status outside the HTTP range means no status line was ever parsed — the peer closed
+        // the connection without sending a response. Report that as an error instead of leaking
+        // the uninitialised 0 into the success shape, where callers checking for "error" miss it.
+        if (res.getHttpStatus() !in HTTP_STATUS_RANGE) {
+            return convertError("sdk_connection_error", "No HTTP response received from server")
+        }
         var json: JSONObject = JSONObject()
         json.put("http_status", res.getHttpStatus())
         try {
@@ -466,6 +486,18 @@ internal class ClientSocket constructor(
                             if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Content-Length - $contentLength")
                         }
                     }
+                    line.startsWith("Connection:", ignoreCase = true) -> {
+                        // The peer is telling us this is the last exchange on this socket. Honour
+                        // it, or the next hop gets written into a connection being torn down.
+                        val wantsClose = line.substringAfter(':')
+                            .split(',')
+                            .any { it.trim().equals("close", ignoreCase = true) }
+                        if (wantsClose) {
+                            mustClose = true
+                            tracer.addDebug(Log.DEBUG, TAG, "Peer sent Connection: close")
+                            tracer.addTrace("Peer sent Connection: close\n")
+                        }
+                    }
                     OPERATOR_TRACKING_HEADERS.any { line!!.startsWith(it, ignoreCase = true) } -> {
                         val currentLine = line!!
                         val colonIdx = currentLine.indexOf(':')
@@ -526,9 +558,15 @@ internal class ClientSocket constructor(
             httpLogger.logResponse(status, trackingHeaders.ifEmpty { null }, body)
             lastOperatorTrackingHeaders = trackingHeaders
             return redirectResult ?: if (bodyBegin && body != null) {
-                ResultHandler(status, null, parseBodyIntoJSONString(body), cookies, operatorTrackingHeaders = trackingHeaders)
+                ResultHandler(
+                    status, null, parseBodyIntoJSONString(body), cookies,
+                    mustCloseConnection = mustClose, operatorTrackingHeaders = trackingHeaders
+                )
             } else {
-                ResultHandler(status, null, null, null, operatorTrackingHeaders = trackingHeaders)
+                ResultHandler(
+                    status, null, null, null,
+                    mustCloseConnection = mustClose, operatorTrackingHeaders = trackingHeaders
+                )
             }
         } catch (ex: Exception) {
             tracer.addDebug(Log.ERROR, TAG, "Client reading exception : ${ex.message}")
@@ -645,6 +683,7 @@ internal class ClientSocket constructor(
         private const val PORT_443 = 443
         private const val CRLF = "\r\n"
         private const val GLOBAL_DEADLINE_MS: Long = 30_000
+        private val HTTP_STATUS_RANGE = 100..599
 
         // Operator-injected tracking headers to capture and log for troubleshooting.
         // Orange uses X-Orange-Trace-Id; Vodafone uses X-VIG-Trace-Id.
