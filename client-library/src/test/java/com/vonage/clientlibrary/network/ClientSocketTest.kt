@@ -375,6 +375,85 @@ class ClientSocketTest {
     }
 
     @Test
+    fun `open reuses one connection across consecutive same-host hops after a cross-host redirect`() {
+        // Models the production silent-auth chain shape (DEVX-11219), extended with a fourth hop:
+        //
+        //   1. api-ap  /v2/verify/../silent-auth/redirect  302 -> api-eu   (cross-host)
+        //   2. api-eu  /oauth2/auth                        301 -> api-eu   (same host)
+        //   3. api-eu  /v0.1/silent-auth/redirect          302 -> api-eu   (same host)
+        //   4. api-eu  /final                              200
+        //
+        // Only the host change may open a second connection: hops 2, 3 and 4 must all travel over
+        // the same socket, proving reuse holds repeatedly rather than just once.
+        fun redirect(status: Int, location: String) = (
+            "HTTP/1.1 $status Found\r\n" +
+            "Location: $location\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+
+        val apStream = ByteArrayInputStream(redirect(302, "https://api-eu.example.com/oauth2/auth"))
+        // A keep-alive server answers all three same-host hops back-to-back on one connection.
+        val euStream = ByteArrayInputStream(
+            redirect(301, "https://api-eu.example.com/v0.1/silent-auth/redirect") +
+            redirect(302, "https://api-eu.example.com/final") +
+            httpResponse(200, body = """{"ok":true}""")
+        )
+        val apOut = ByteArrayOutputStream()
+        val euOut = ByteArrayOutputStream()
+
+        val apSocket = mockk<SSLSocket>(relaxed = true)
+        every { apSocket.getInputStream() } returns apStream
+        every { apSocket.getOutputStream() } returns apOut
+        every { apSocket.inetAddress } returns mockk(relaxed = true)
+        every { apSocket.port } returns 443
+
+        val euSocket = mockk<SSLSocket>(relaxed = true)
+        every { euSocket.getInputStream() } returns euStream
+        every { euSocket.getOutputStream() } returns euOut
+        every { euSocket.inetAddress } returns mockk(relaxed = true)
+        every { euSocket.port } returns 443
+
+        val connectedHosts = mutableListOf<String>()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+            val host = firstArg<String>()
+            connectedHosts.add(host)
+            if (host == "api-ap.example.com") apSocket else euSocket
+        }
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(
+            URL("https://api-ap.example.com/v2/verify/abc/silent-auth/redirect"),
+            emptyMap(),
+            null,
+            10
+        )
+
+        // One handshake per distinct authority: the cross-host hop, then a single api-eu connection.
+        assertEquals(
+            "Only the host change may open a new connection",
+            listOf("api-ap.example.com", "api-eu.example.com"),
+            connectedHosts
+        )
+
+        // All three api-eu hops must have been written to the one reused socket.
+        val euRequests = euOut.toString(Charsets.UTF_8.name())
+        assertEquals(
+            "All three same-host hops should be sent on the reused connection: $euRequests",
+            3,
+            Regex("^GET ", RegexOption.MULTILINE).findAll(euRequests).count()
+        )
+        assertTrue("Hop 2 missing", euRequests.contains("GET /oauth2/auth"))
+        assertTrue("Hop 3 missing", euRequests.contains("GET /v0.1/silent-auth/redirect"))
+        assertTrue("Hop 4 missing", euRequests.contains("GET /final"))
+        assertFalse("Reused hops must not force a close", euRequests.contains("Connection: close"))
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
     fun `open reports sdk_connection_error when peer closes without responding`() {
         // Zero bytes back: readHttpLine hits EOF on its first call, so the parse loop never runs
         // and no status line is read. That must not leak the uninitialised status 0 into the
