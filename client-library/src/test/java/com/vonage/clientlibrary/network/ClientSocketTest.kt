@@ -215,6 +215,53 @@ class ClientSocketTest {
     }
 
     @Test
+    fun `open follows a chain that uses its full redirect budget`() {
+        // A chain that completes within the limit must succeed. Counting requests rather than
+        // pending redirects made a successful two-redirect chain report "Too many redirects".
+        val redirect = (
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: https://api.example.com/next\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(redirect + redirect + httpResponse(200, body = """{"ok":true}"""))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 2)
+
+        assertFalse("Chain within the limit must not error: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open returns sdk_redirect_error one redirect past the limit`() {
+        val redirect = (
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: https://api.example.com/next\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(redirect + redirect + redirect + redirect)
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 2)
+
+        assertEquals("sdk_redirect_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open returns a direct response when no redirects are allowed`() {
+        stubResponse(httpResponse(200, body = """{"ok":true}"""))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 0)
+
+        assertFalse("A direct response must not be treated as a redirect: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+    }
+
+    @Test
     fun `open returns sdk_redirect_error when redirect limit exceeded`() {
         // Use same-host redirects so all responses go through one socket connection.
         // Concatenate enough redirect responses to exceed the limit.

@@ -147,7 +147,11 @@ internal class ClientSocket constructor(
                 return convertError("sdk_connection_error", "ex: ".plus(ex.localizedMessage))
             }
         } while (redirectURL != null && redirectCount <= maxRedirectCount)
-        if (redirectCount >= maxRedirectCount)
+        // The limit is only exceeded if we stopped while a redirect was still pending. Counting
+        // requests instead rejected chains that had already completed: a successful chain using its
+        // full redirect budget returned "Too many redirects", and with maxRedirectCount = 0 even a
+        // direct response was rejected.
+        if (redirectURL != null)
             return convertError("sdk_redirect_error", "Too many redirects")
         tracer.addDebug(Log.DEBUG, TAG, "Open completed")
         if (result != null)
