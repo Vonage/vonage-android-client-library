@@ -517,6 +517,12 @@ internal class ClientSocket constructor(
                             tracer.addDebug(Log.DEBUG, TAG, "Operator tracking header: $name=$value")
                         }
                     }
+                    line.isEmpty() && status in 100..199 -> {
+                        // An informational response has no body and is followed by the final
+                        // response on the same connection. Keep parsing rather than treating it
+                        // as the completed request.
+                        tracer.addTrace("Informational response received; awaiting final response\n")
+                    }
                     line.isEmpty() && earlyRedirect -> {
                         // End of headers on a redirect. Drain the body so the socket stays clean for
                         // reuse. Chunked or a known Content-Length can be drained exactly; without
@@ -545,6 +551,7 @@ internal class ClientSocket constructor(
                         // Only JSON content types are surfaced as a body; anything else is consumed
                         // to keep the stream framed but not returned, matching prior behaviour.
                         val rawBody = when {
+                            !responseCanHaveBody(status) -> ""
                             chunked -> readChunkedBody(rawInput)
                             contentLength >= 0 -> readFixedLengthBody(rawInput, contentLength)
                             else -> readMultipleBytes(rawInput, 65536) ?: ""
@@ -614,11 +621,14 @@ internal class ClientSocket constructor(
     private fun isJsonType(type: String): Boolean =
         type == "application/json" || type == "application/hal+json" || type == "application/problem+json"
 
+    private fun responseCanHaveBody(status: Int): Boolean =
+        status != 204 && status != 205 && status != 304
+
     /**
      * Reads exactly [length] body bytes from the stream and decodes them as UTF-8. Bytes are
      * buffered and decoded once so multibyte characters split across TCP segments stay intact.
-     * Stops early on EOF. A definite length lets us return without waiting for the peer to close,
-     * which is what makes a kept-alive socket reusable.
+     * A premature EOF is an invalid HTTP response and must fail rather than leave a partial body
+     * on a socket that could otherwise be reused.
      */
     private fun readFixedLengthBody(stream: InputStream, length: Int): String {
         if (length <= 0) return ""
@@ -627,7 +637,7 @@ internal class ClientSocket constructor(
         var remaining = length
         while (remaining > 0) {
             val n = stream.read(buf, 0, minOf(buf.size, remaining))
-            if (n <= 0) break
+            if (n <= 0) throw IOException("Unexpected EOF while reading $length-byte response body")
             out.write(buf, 0, n)
             remaining -= n
         }
@@ -636,34 +646,38 @@ internal class ClientSocket constructor(
 
     /**
      * Reads a chunked (Transfer-Encoding: chunked) body to its terminating zero-length chunk and
-     * decodes the concatenated data as UTF-8. Terminates on the final chunk rather than on EOF, so
-     * the socket is left clean and reusable. Trailer headers after the last chunk are consumed.
+     * decodes the concatenated data as UTF-8. Any truncated or malformed frame is rejected so we
+     * never treat a dead or unclean connection as reusable. Trailer headers after the last chunk
+     * are consumed before returning.
      */
     private fun readChunkedBody(stream: InputStream): String {
         val out = ByteArrayOutputStream()
         while (true) {
-            val sizeLine = readHttpLine(stream) ?: break
+            val sizeLine = readHttpLine(stream)
+                ?: throw IOException("Unexpected EOF while reading chunk size")
             val token = sizeLine.trim().substringBefore(';')
-            if (token.isEmpty()) continue
-            val size = token.toIntOrNull(16) ?: break
-            if (size <= 0) {
+            val size = token.toIntOrNull(16)
+                ?: throw IOException("Invalid chunk size: $sizeLine")
+            if (size < 0) throw IOException("Negative chunk size: $sizeLine")
+            if (size == 0) {
                 // Consume any trailer headers up to the blank line that ends the message.
-                var trailer = readHttpLine(stream)
-                while (trailer != null && trailer.isNotEmpty()) trailer = readHttpLine(stream)
-                break
+                while (true) {
+                    val trailer = readHttpLine(stream)
+                        ?: throw IOException("Unexpected EOF while reading chunk trailers")
+                    if (trailer.isEmpty()) return out.toString(StandardCharsets.UTF_8.name())
+                }
             }
             val buf = ByteArray(size)
             var read = 0
             while (read < size) {
                 val n = stream.read(buf, read, size - read)
-                if (n <= 0) break
+                if (n <= 0) throw IOException("Unexpected EOF while reading chunk data")
                 read += n
             }
-            out.write(buf, 0, read)
-            // Consume the CRLF that terminates the chunk data.
-            readHttpLine(stream)
+            out.write(buf)
+            // A CRLF must immediately follow every chunk's data.
+            if (readHttpLine(stream) != "") throw IOException("Missing chunk delimiter")
         }
-        return out.toString(StandardCharsets.UTF_8.name())
     }
 
     fun parseBodyIntoJSONString(body: String?): String? {

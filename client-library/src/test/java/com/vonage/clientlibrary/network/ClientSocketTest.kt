@@ -10,6 +10,8 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.InputStream
 import java.net.URL
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
@@ -88,6 +90,20 @@ class ClientSocketTest {
         return sb.toString().toByteArray(Charsets.UTF_8)
     }
 
+    /**
+     * Serves one header-only response, then fails rather than returning EOF. This models a peer
+     * that keeps a bodyless HTTP/1.1 response connection open and proves the parser does not wait
+     * for connection close to delimit a response that cannot contain a body.
+     */
+    private class HeaderOnlyResponseInputStream(private val response: ByteArray) : InputStream() {
+        private var index = 0
+
+        override fun read(): Int {
+            if (index >= response.size) throw IOException("Bodyless response must not be read past headers")
+            return response[index++].toInt() and 0xFF
+        }
+    }
+
     // ------------------------------------------------------------------
     // Tests
     // ------------------------------------------------------------------
@@ -102,6 +118,72 @@ class ClientSocketTest {
         assertFalse("Should not contain error", result.has("error"))
         assertEquals(200, result.getInt("http_status"))
         assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open does not wait for EOF after a persistent 204 response`() {
+        val response = "HTTP/1.1 204 No Content\r\n\r\n".toByteArray(Charsets.UTF_8)
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns HeaderOnlyResponseInputStream(response)
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(204, result.getInt("http_status"))
+    }
+
+    @Test
+    fun `open skips an interim response and returns its final response`() {
+        val interim = "HTTP/1.1 100 Continue\r\n\r\n".toByteArray(Charsets.UTF_8)
+        stubResponse(interim + httpResponse(200, body = """{"ok":true}"""))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open rejects a truncated Content-Length redirect instead of reusing its socket`() {
+        val truncatedRedirect = (
+            "HTTP/1.1 302 Found\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: 5\r\n" +
+            "\r\n" +
+            "xy"
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(truncatedRedirect)
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+        verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        verify { mockSSLSocket.close() }
+    }
+
+    @Test
+    fun `open rejects a truncated chunked response`() {
+        val truncatedChunk = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
+            "\r\n" +
+            "b\r\n" +
+            "{\"ok\":"
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(truncatedChunk)
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
     }
 
     @Test
