@@ -745,9 +745,11 @@ class ClientSocketTest {
     }
 
     @Test
-    fun `open completes a redirect whose body is delimited by connection close`() {
+    fun `open uses a fresh connection when a redirect body is delimited by connection close`() {
         // A non-3xx status carrying Location, with no Content-Length and no chunked framing: the
-        // body ends at EOF, so the socket is spent and the next hop needs a fresh connection.
+        // body ends at EOF, so the socket is spent. Asserting only the final 200 is not enough —
+        // that passes even when the socket is wrongly reused and the stale-connection retry covers
+        // for it. Assert the spent socket is never written to a second time.
         val unframed = (
             "HTTP/1.1 200 OK\r\n" +
             "Location: https://api.example.com/final\r\n" +
@@ -756,14 +758,87 @@ class ClientSocketTest {
             "<html>redirecting</html>"
         ).toByteArray(Charsets.UTF_8)
 
-        val responses = listOf(unframed, httpResponse(200, body = """{"ok":true}""")).iterator()
+        val firstOut = ByteArrayOutputStream()
+        val firstSocket = mockk<SSLSocket>(relaxed = true)
+        every { firstSocket.getInputStream() } returns ByteArrayInputStream(unframed)
+        every { firstSocket.getOutputStream() } returns firstOut
+        every { firstSocket.inetAddress } returns mockk(relaxed = true)
+        every { firstSocket.port } returns 443
+
+        val sockets = listOf(firstSocket, makeMockSocket(httpResponse(200, body = """{"ok":true}"""))).iterator()
         every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
-            makeMockSocket(if (responses.hasNext()) responses.next() else ByteArray(0))
+            if (sockets.hasNext()) sockets.next() else makeMockSocket(ByteArray(0))
         }
 
         val cs = ClientSocket(mockTracer)
         val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
 
+        val firstRequests = firstOut.toString(Charsets.UTF_8.name())
+        assertEquals(
+            "Spent connection must not be written to again: $firstRequests",
+            1,
+            Regex("^GET ", RegexOption.MULTILINE).findAll(firstRequests).count()
+        )
+        verify { firstSocket.close() }
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open reports an error when the peer closes after an informational response`() {
+        // An interim 1xx is not a final response. Reporting it as one would hand the caller
+        // {"http_status":100} with no error key — the silent success shape this SDK must never emit.
+        stubResponse("HTTP/1.1 100 Continue\r\n\r\n".toByteArray(Charsets.UTF_8))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+        assertFalse("Interim status must not be returned as a final response", result.has("http_status"))
+    }
+
+    @Test
+    fun `open closes the connection when the redirect limit is exceeded`() {
+        // The pending redirect keeps the socket open for a hop that never runs, so the error path
+        // has to close it or every over-limit chain leaks a socket.
+        val redirect = (
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: https://api.example.com/next\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(redirect + redirect + redirect + redirect)
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 2)
+
+        assertEquals("sdk_redirect_error", result.getString("error"))
+        verify { mockSSLSocket.close() }
+    }
+
+    @Test
+    fun `open drains a chunked redirect body and continues on the same connection`() {
+        // Draining must consume exactly the chunked frame: reading too little or too much would
+        // desynchronise the stream and garble the next response on the reused socket.
+        val chunkedRedirect = (
+            "HTTP/1.1 302 Found\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
+            "\r\n" +
+            "10\r\n" +
+            "0123456789abcdef\r\n" +
+            "5\r\n" +
+            "12345\r\n" +
+            "0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(chunkedRedirect + httpResponse(200, body = """{"ok":true}"""))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
         assertFalse("Should not contain error: $result", result.has("error"))
         assertEquals(200, result.getInt("http_status"))
         assertTrue(result.getJSONObject("response_body").getBoolean("ok"))

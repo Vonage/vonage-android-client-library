@@ -151,8 +151,13 @@ internal class ClientSocket constructor(
         // requests instead rejected chains that had already completed: a successful chain using its
         // full redirect budget returned "Too many redirects", and with maxRedirectCount = 0 even a
         // direct response was rejected.
-        if (redirectURL != null)
+        if (redirectURL != null) {
+            // The pending redirect kept the socket open for a hop that will never run, and the
+            // cleanup below the loop was skipped for the same reason. Close it here or repeated
+            // over-limit chains leak a TCP+TLS socket each.
+            if (connectedAuthority != null) runCatching { stopConnection() }
             return convertError("sdk_redirect_error", "Too many redirects")
+        }
         tracer.addDebug(Log.DEBUG, TAG, "Open completed")
         if (result != null)
             return convertResultHandler(result)
@@ -564,16 +569,18 @@ internal class ClientSocket constructor(
                     }
                     line.isEmpty() && earlyRedirect -> {
                         // End of headers on a redirect. Drain the body so the socket stays clean for
-                        // reuse. Chunked or a known Content-Length can be drained exactly; without
-                        // either we can't safely frame the body, so mark the connection to be closed.
+                        // reuse, without retaining bytes we are about to discard: the length is
+                        // peer-controlled and buffering it could exhaust the heap. Chunked or a known
+                        // Content-Length can be drained exactly; without either we cannot frame the
+                        // body, so mark the connection to be closed.
                         when {
                             chunked -> {
                                 tracer.addTrace("Draining chunked redirect body\n")
-                                readChunkedBody(rawInput)
+                                drainChunkedBody(rawInput)
                             }
                             contentLength >= 0 -> {
                                 tracer.addTrace("Draining $contentLength bytes for redirect body\n")
-                                readFixedLengthBody(rawInput, contentLength)
+                                drainFixedLengthBody(rawInput, contentLength)
                             }
                             else -> {
                                 tracer.addTrace("Redirect with no Content-Length — closing connection\n")
@@ -611,6 +618,13 @@ internal class ClientSocket constructor(
                 line = readHttpLine(rawInput)
             }
 
+            // An informational response is not a final response. If the peer closed after sending
+            // one, no final status line ever arrived: failing here lets a reused socket be retried
+            // and stops an interim status leaking to the caller inside the success shape.
+            if (status in 100..199) {
+                throw IOException("Connection closed after an informational response; no final response received")
+            }
+
             // An HTTP/1.0 (or earlier) response is not persistent unless the peer explicitly asked
             // to keep the connection alive, so a following same-host hop must not reuse this socket.
             if (legacyHttpVersion && !peerRequestedKeepAlive) {
@@ -630,7 +644,12 @@ internal class ClientSocket constructor(
             tracer.addTrace("Status - $status ${DateUtils.now()}\nBody - $body\n")
             httpLogger.logResponse(status, trackingHeaders.ifEmpty { null }, body)
             lastOperatorTrackingHeaders = trackingHeaders
-            return redirectResult ?: if (bodyBegin && body != null) {
+            // A non-3xx response may still carry a Location header. redirectResult was built by
+            // parseRedirect() with the default mustCloseConnection = false, so every close decision
+            // made above — unframed body, legacy version, explicit "Connection: close" — has to be
+            // applied here or it is silently dropped and the next hop reuses a spent socket.
+            redirectResult?.let { return if (mustClose) it.withMustClose() else it }
+            return if (bodyBegin && body != null) {
                 ResultHandler(
                     status, null, parseBodyIntoJSONString(body), cookies,
                     mustCloseConnection = mustClose, operatorTrackingHeaders = trackingHeaders
@@ -676,33 +695,57 @@ internal class ClientSocket constructor(
         status != 204 && status != 205 && status != 304
 
     /**
-     * Reads exactly [length] body bytes from the stream and decodes them as UTF-8. Bytes are
-     * buffered and decoded once so multibyte characters split across TCP segments stay intact.
-     * A premature EOF is an invalid HTTP response and must fail rather than leave a partial body
-     * on a socket that could otherwise be reused.
+     * Reads exactly [length] body bytes and decodes them as UTF-8. Bytes are buffered and decoded
+     * once so multibyte characters split across TCP segments stay intact.
      */
     private fun readFixedLengthBody(stream: InputStream, length: Int): String {
-        if (length <= 0) return ""
-        val out = ByteArrayOutputStream(minOf(length, 8192))
+        val out = ByteArrayOutputStream(minOf(length.coerceAtLeast(0), 8192))
+        transferFixedLengthBody(stream, length, out)
+        return out.toString(StandardCharsets.UTF_8.name())
+    }
+
+    /** Consumes exactly [length] body bytes without retaining them. */
+    private fun drainFixedLengthBody(stream: InputStream, length: Int) =
+        transferFixedLengthBody(stream, length, null)
+
+    /**
+     * Copies [length] body bytes through a fixed buffer into [sink], or discards them when [sink] is
+     * null. A premature EOF is an invalid HTTP response and must fail rather than leave a partial
+     * body on a socket that could otherwise be reused.
+     */
+    private fun transferFixedLengthBody(stream: InputStream, length: Int, sink: ByteArrayOutputStream?) {
+        if (length <= 0) return
         val buf = ByteArray(8192)
         var remaining = length
         while (remaining > 0) {
             val n = stream.read(buf, 0, minOf(buf.size, remaining))
             if (n <= 0) throw IOException("Unexpected EOF while reading $length-byte response body")
-            out.write(buf, 0, n)
+            sink?.write(buf, 0, n)
             remaining -= n
         }
-        return out.toString(StandardCharsets.UTF_8.name())
     }
 
     /**
      * Reads a chunked (Transfer-Encoding: chunked) body to its terminating zero-length chunk and
-     * decodes the concatenated data as UTF-8. Any truncated or malformed frame is rejected so we
-     * never treat a dead or unclean connection as reusable. Trailer headers after the last chunk
-     * are consumed before returning.
+     * decodes the concatenated data as UTF-8.
      */
     private fun readChunkedBody(stream: InputStream): String {
         val out = ByteArrayOutputStream()
+        transferChunkedBody(stream, out)
+        return out.toString(StandardCharsets.UTF_8.name())
+    }
+
+    /** Consumes a chunked body without retaining it, still validating the framing. */
+    private fun drainChunkedBody(stream: InputStream) = transferChunkedBody(stream, null)
+
+    /**
+     * Walks a chunked body to its terminating zero-length chunk, copying data into [sink] or
+     * discarding it when [sink] is null. Any truncated or malformed frame is rejected so we never
+     * treat a dead or unclean connection as reusable. Chunk data is copied through a fixed buffer:
+     * the advertised size is peer-controlled, and allocating from it would risk an OutOfMemoryError
+     * that our Exception handling cannot catch. Trailer headers are consumed before returning.
+     */
+    private fun transferChunkedBody(stream: InputStream, sink: ByteArrayOutputStream?) {
         val buf = ByteArray(8192)
         while (true) {
             val sizeLine = readHttpLine(stream)
@@ -716,17 +759,14 @@ internal class ClientSocket constructor(
                 while (true) {
                     val trailer = readHttpLine(stream)
                         ?: throw IOException("Unexpected EOF while reading chunk trailers")
-                    if (trailer.isEmpty()) return out.toString(StandardCharsets.UTF_8.name())
+                    if (trailer.isEmpty()) return
                 }
             }
-            // Copy the chunk through a fixed buffer. Never allocate from the advertised size: it is
-            // peer-controlled, and a bogus value would otherwise exhaust the heap with an
-            // OutOfMemoryError that our Exception handlers cannot catch.
             var remaining = size
             while (remaining > 0) {
                 val n = stream.read(buf, 0, minOf(buf.size, remaining))
                 if (n <= 0) throw IOException("Unexpected EOF while reading chunk data")
-                out.write(buf, 0, n)
+                sink?.write(buf, 0, n)
                 remaining -= n
             }
             // A CRLF must immediately follow every chunk's data.
