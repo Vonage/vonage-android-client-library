@@ -260,9 +260,10 @@ class ClientSocketTest {
 
     @Test
     fun `open opens a fresh connection for same-authority redirect after Connection close`() {
-        // Regression: the first hop always sends "Connection: close" (keepAlive is false on the
-        // first request), so a conforming server tears the socket down after answering. Reusing
-        // it for a same-authority redirect reads EOF, which surfaced as {"http_status": 0}.
+        // Even though the SDK now requests keep-alive, a redirect whose response carries
+        // "Connection: close" tells us the peer is tearing the socket down. Reusing it for the
+        // same-authority redirect would read EOF, which surfaced as {"http_status": 0}, so we
+        // must open a fresh connection.
         val redirectResponse = (
             "HTTP/1.1 301 Moved Permanently\r\n" +
             "Location: https://api.example.com/final\r\n" +
@@ -334,8 +335,96 @@ class ClientSocketTest {
     }
 
     @Test
-    fun `open does not reuse connection when redirect changes port`() {
+    fun `open reuses one connection for same-host redirect when server keeps it alive`() {
+        // DEVX-11219: with keep-alive requested and a redirect that leaves the socket open
+        // (framed by Content-Length, no "Connection: close"), the same-authority redirect must
+        // reuse the existing socket instead of opening a new one.
         val redirectResponse = (
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        val finalResponse = httpResponse(200, body = """{"ok":true}""")
+        // One socket serves both hops back-to-back, as a keep-alive server would.
+        stubResponse(redirectResponse + finalResponse)
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open omits Connection close on GET request so the socket can be kept alive`() {
+        val outputStream = ByteArrayOutputStream()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns outputStream
+        every { mockSSLSocket.getInputStream() } returns
+            ByteArrayInputStream(httpResponse(200, body = """{"ok":true}"""))
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        val sentRequest = outputStream.toString(Charsets.UTF_8.name())
+        assertFalse("GET request must not force Connection: close", sentRequest.contains("Connection: close"))
+    }
+
+    @Test
+    fun `open decodes a chunked final response`() {
+        // A keep-alive server frames the body with chunked encoding instead of Content-Length.
+        // The reader must terminate on the zero-length chunk rather than waiting for EOF.
+        val chunked = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
+            "\r\n" +
+            "b\r\n" +               // 0xb = 11 bytes
+            "{\"ok\":true}\r\n" +
+            "0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(chunked)
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open reconnects for same-host redirect when body cannot be framed`() {
+        // A redirect with neither Content-Length nor chunked framing can't be drained safely, so
+        // the connection must not be reused even though the authority matches and no Connection:
+        // close was sent.
+        val redirectResponse = (
+            "HTTP/1.1 301 Moved Permanently\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        val finalResponse = httpResponse(200, body = """{"ok":true}""")
+
+        val responses = listOf(redirectResponse, finalResponse).iterator()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+            makeMockSocket(if (responses.hasNext()) responses.next() else ByteArray(0))
+        }
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        verify(exactly = 2) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertEquals(200, result.getInt("http_status"))
+    }
+
+    @Test
+    fun `open does not reuse connection when redirect changes port`() {        val redirectResponse = (
             "HTTP/1.1 301 Moved Permanently\r\n" +
             "Location: https://api.example.com:8443/other\r\n" +
             "Content-Length: 0\r\n" +

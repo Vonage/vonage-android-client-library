@@ -2,6 +2,7 @@ package com.vonage.clientlibrary.network
 
 import android.os.Build
 import android.util.Log
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -75,11 +76,12 @@ internal class ClientSocket constructor(
                     tracer.addDebug(Log.DEBUG, TAG, "Reusing connection, updated timeout to ${socket.soTimeout}ms")
                 }
 
-                // Send keep-alive only when reusing an existing connection (i.e., a same-authority
-                // redirect hop). For the first request we don't know if a redirect is coming, so
-                // send Connection: close — the server will close after responding and we reconnect
-                // if needed. This avoids hanging on a keep-alive socket with no Content-Length.
-                val keepAlive = reusingConnection
+                // Request keep-alive on every hop so the server leaves the TCP+TLS socket open for
+                // a following same-authority redirect (DEVX-11219). Whether we actually reuse it is
+                // still gated by connectionKeptAlive below: we only reuse when the peer did not send
+                // "Connection: close" and the response body was fully framed (drained by
+                // Content-Length or chunked), so we never write into a socket being torn down.
+                val keepAlive = true
 
                 result = if (redirectCount == 1)
                     sendCommand(nurl, headers, operator, null, requestId, keepAlive = keepAlive)
@@ -429,6 +431,7 @@ internal class ClientSocket constructor(
         var redirectResult: ResultHandler? = null
         var bodyBegin: Boolean = false
         var contentLength: Int = -1
+        var chunked: Boolean = false
         var earlyRedirect: Boolean = false
         var mustClose: Boolean = false
         val bodyBuilder = StringBuilder()  // DEVX-11223: avoid O(n²) string concat
@@ -486,6 +489,12 @@ internal class ClientSocket constructor(
                             if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Content-Length - $contentLength")
                         }
                     }
+                    line.startsWith("Transfer-Encoding:", ignoreCase = true) -> {
+                        if (line.substringAfter(':').contains("chunked", ignoreCase = true)) {
+                            chunked = true
+                            if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Transfer-Encoding: chunked")
+                        }
+                    }
                     line.startsWith("Connection:", ignoreCase = true) -> {
                         // The peer is telling us this is the last exchange on this socket. Honour
                         // it, or the next hop gets written into a connection being torn down.
@@ -508,38 +517,44 @@ internal class ClientSocket constructor(
                             tracer.addDebug(Log.DEBUG, TAG, "Operator tracking header: $name=$value")
                         }
                     }
-                    (type == "application/json" || type == "application/hal+json" || type == "application/problem+json") && line.isEmpty() -> {
-                        bodyBegin = true
-                    }
                     line.isEmpty() && earlyRedirect -> {
-                        // End of headers. Drain body by exact byte count to keep stream clean for reuse.
-                        // If Content-Length is unknown, we can't safely drain — must close the connection.
-                        if (contentLength < 0) {
-                            tracer.addTrace("Redirect with no Content-Length — closing connection\n")
-                            mustClose = true
-                        } else {
-                            tracer.addTrace("Draining $contentLength bytes for redirect body\n")
-                            val drainBuf = ByteArray(4096)
-                            var totalRead = 0
-                            while (totalRead < contentLength) {
-                                val n = rawInput.read(drainBuf, 0, minOf(drainBuf.size, contentLength - totalRead))
-                                if (n <= 0) break
-                                totalRead += n
+                        // End of headers on a redirect. Drain the body so the socket stays clean for
+                        // reuse. Chunked or a known Content-Length can be drained exactly; without
+                        // either we can't safely frame the body, so mark the connection to be closed.
+                        when {
+                            chunked -> {
+                                tracer.addTrace("Draining chunked redirect body\n")
+                                readChunkedBody(rawInput)
                             }
-                            tracer.addTrace("Drained $totalRead bytes\n")
+                            contentLength >= 0 -> {
+                                tracer.addTrace("Draining $contentLength bytes for redirect body\n")
+                                readFixedLengthBody(rawInput, contentLength)
+                            }
+                            else -> {
+                                tracer.addTrace("Redirect with no Content-Length — closing connection\n")
+                                mustClose = true
+                            }
                         }
                         break
                     }
-                    bodyBegin -> {
-                        // Body lines: read as bytes to keep Content-Length accounting accurate.
-                        // readHttpLine already stripped CRLF; append directly.
-                        bodyBuilder.append(line)
-                        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Adding to body\n")
-                        // Stop reading when full Content-Length body consumed (byte-accurate via readHttpLine)
-                        if (contentLength >= 0 && bodyBuilder.length >= contentLength) {
-                            tracer.addTrace("Body complete via Content-Length - ${DateUtils.now()}\n")
-                            break
+                    line.isEmpty() -> {
+                        // End of headers on a non-redirect response. Read the body deterministically
+                        // so a kept-alive socket never blocks waiting for EOF (DEVX-11219). A body
+                        // with no Content-Length and no chunked framing ends at connection close, so
+                        // read to EOF — a conforming keep-alive server always supplies framing.
+                        // Only JSON content types are surfaced as a body; anything else is consumed
+                        // to keep the stream framed but not returned, matching prior behaviour.
+                        val rawBody = when {
+                            chunked -> readChunkedBody(rawInput)
+                            contentLength >= 0 -> readFixedLengthBody(rawInput, contentLength)
+                            else -> readMultipleBytes(rawInput, 65536) ?: ""
                         }
+                        if (isJsonType(type)) {
+                            bodyBuilder.append(rawBody)
+                            bodyBegin = bodyBuilder.isNotEmpty()
+                        }
+                        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Body complete - ${DateUtils.now()}\n")
+                        break
                     }
                 }
                 line = readHttpLine(rawInput)
@@ -594,6 +609,61 @@ internal class ClientSocket constructor(
             sb.append(b.toChar())
             prev = b
         }
+    }
+
+    private fun isJsonType(type: String): Boolean =
+        type == "application/json" || type == "application/hal+json" || type == "application/problem+json"
+
+    /**
+     * Reads exactly [length] body bytes from the stream and decodes them as UTF-8. Bytes are
+     * buffered and decoded once so multibyte characters split across TCP segments stay intact.
+     * Stops early on EOF. A definite length lets us return without waiting for the peer to close,
+     * which is what makes a kept-alive socket reusable.
+     */
+    private fun readFixedLengthBody(stream: InputStream, length: Int): String {
+        if (length <= 0) return ""
+        val out = ByteArrayOutputStream(minOf(length, 8192))
+        val buf = ByteArray(8192)
+        var remaining = length
+        while (remaining > 0) {
+            val n = stream.read(buf, 0, minOf(buf.size, remaining))
+            if (n <= 0) break
+            out.write(buf, 0, n)
+            remaining -= n
+        }
+        return out.toString(StandardCharsets.UTF_8.name())
+    }
+
+    /**
+     * Reads a chunked (Transfer-Encoding: chunked) body to its terminating zero-length chunk and
+     * decodes the concatenated data as UTF-8. Terminates on the final chunk rather than on EOF, so
+     * the socket is left clean and reusable. Trailer headers after the last chunk are consumed.
+     */
+    private fun readChunkedBody(stream: InputStream): String {
+        val out = ByteArrayOutputStream()
+        while (true) {
+            val sizeLine = readHttpLine(stream) ?: break
+            val token = sizeLine.trim().substringBefore(';')
+            if (token.isEmpty()) continue
+            val size = token.toIntOrNull(16) ?: break
+            if (size <= 0) {
+                // Consume any trailer headers up to the blank line that ends the message.
+                var trailer = readHttpLine(stream)
+                while (trailer != null && trailer.isNotEmpty()) trailer = readHttpLine(stream)
+                break
+            }
+            val buf = ByteArray(size)
+            var read = 0
+            while (read < size) {
+                val n = stream.read(buf, read, size - read)
+                if (n <= 0) break
+                read += n
+            }
+            out.write(buf, 0, read)
+            // Consume the CRLF that terminates the chunk data.
+            readHttpLine(stream)
+        }
+        return out.toString(StandardCharsets.UTF_8.name())
     }
 
     fun parseBodyIntoJSONString(body: String?): String? {
