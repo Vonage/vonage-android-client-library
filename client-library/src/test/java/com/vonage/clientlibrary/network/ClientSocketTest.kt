@@ -1429,13 +1429,14 @@ class ClientSocketTest {
 
     @Test
     fun `open rejects conflicting duplicate Content-Length headers`() {
+        val body = """{"ok":true}"""
         stubResponse((
             "HTTP/1.1 200 OK\r\n" +
             "Content-Type: application/json\r\n" +
             "Content-Length: 2\r\n" +
-            "Content-Length: 12\r\n" +
+            "Content-Length: ${body.toByteArray(Charsets.UTF_8).size}\r\n" +
             "\r\n" +
-            "{}"
+            body
         ).toByteArray(Charsets.UTF_8))
 
         val result = ClientSocket(mockTracer).open(URL("https://api.example.com/"), emptyMap(), null, 5)
