@@ -153,6 +153,19 @@ class ClientSocketTest {
         }
     }
 
+    /** Serves [prefix], then throws [failure] instead of returning EOF. */
+    private class ErrorAfterPrefixInputStream(
+        private val prefix: ByteArray,
+        private val failure: Error
+    ) : InputStream() {
+        private var index = 0
+
+        override fun read(): Int {
+            if (index < prefix.size) return prefix[index++].toInt() and 0xFF
+            throw failure
+        }
+    }
+
     // ------------------------------------------------------------------
     // Tests
     // ------------------------------------------------------------------
@@ -233,6 +246,129 @@ class ClientSocketTest {
         val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `post consumes an informational response and returns the final response`() {
+        stubResponse(
+            "HTTP/1.1 100 Continue\r\nX-Interim: ignored\r\n\r\n".toByteArray(Charsets.UTF_8) +
+                httpResponse(200, body = """{"ok":true}""")
+        )
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.post(URL("https://api.example.com/"), emptyMap(), "{}")
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `post rejects an informational response without a final response`() {
+        stubResponse("HTTP/1.1 100 Continue\r\n\r\n".toByteArray(Charsets.UTF_8))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.post(URL("https://api.example.com/"), emptyMap(), "{}")
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+        assertFalse("Interim status must not be returned as final", result.has("http_status"))
+    }
+
+    @Test
+    fun `post rejects a 101 protocol upgrade`() {
+        stubResponse("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n".toByteArray(Charsets.UTF_8))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.post(URL("https://api.example.com/"), emptyMap(), "{}")
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open rejects EOF before final response headers complete`() {
+        stubResponse("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n".toByteArray(Charsets.UTF_8))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+        assertFalse("Incomplete response must not expose an HTTP status", result.has("http_status"))
+    }
+
+    @Test
+    fun `open rejects a Location header without a status line`() {
+        stubResponse("Location: https://api.example.com/final\r\n\r\n".toByteArray(Charsets.UTF_8))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open does not follow a non-HTTPS redirect`() {
+        val response = (
+            "HTTP/1.1 302 Found\r\n" +
+                "Location: ftp://api.example.com:443/final\r\n" +
+                "Content-Length: 0\r\n" +
+                "\r\n"
+            ).toByteArray(Charsets.UTF_8)
+        stubResponse(response)
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertEquals(302, result.getInt("http_status"))
+    }
+
+    @Test
+    fun `open preserves UTF-8 split across close-delimited read blocks`() {
+        val prefix = "{\"v\":\""
+        val filler = "a".repeat(65_536 - prefix.toByteArray(Charsets.UTF_8).size - 1)
+        val expected = "${filler}é"
+        val body = "$prefix$expected\"}"
+        // The first byte of é is the final byte of the first 65,536-byte read.
+        assertEquals(65_537, (prefix + expected).toByteArray(Charsets.UTF_8).size)
+        val response = (
+            "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: application/json\r\n" +
+                "Connection: close\r\n" +
+                "\r\n" +
+                body
+            ).toByteArray(Charsets.UTF_8)
+        stubResponse(response)
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertEquals(expected, result.getJSONObject("response_body").getString("v"))
+    }
+
+    @Test
+    fun `open does not retry a VM Error from a reused connection`() {
+        val redirect = (
+            "HTTP/1.1 302 Found\r\n" +
+                "Location: https://api.example.com/final\r\n" +
+                "Content-Length: 0\r\n" +
+                "\r\n"
+            ).toByteArray(Charsets.UTF_8)
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns
+            ErrorAfterPrefixInputStream(redirect, OutOfMemoryError("simulated VM failure"))
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        val thrown = assertThrows(OutOfMemoryError::class.java) {
+            cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+        }
+
+        assertEquals("simulated VM failure", thrown.message)
+        verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
     }
 
     @Test
@@ -1175,9 +1311,9 @@ class ClientSocketTest {
     }
 
     @Test
-    fun `open does not treat x-chunked as chunked encoding`() {
-        // "x-chunked" is a different transfer-coding. A substring match would send this body into
-        // the chunk decoder, which would reject or desynchronise an otherwise parseable response.
+    fun `open rejects an unsupported x-chunked transfer coding`() {
+        // Transfer-Encoding is authoritative over Content-Length. "x-chunked" is a different and
+        // unsupported coding, so it must not fall through to the Content-Length body.
         val body = """{"ok":true}"""
         stubResponse((
             "HTTP/1.1 200 OK\r\n" +
@@ -1186,6 +1322,41 @@ class ClientSocketTest {
             "Content-Length: ${body.toByteArray(Charsets.UTF_8).size}\r\n" +
             "\r\n" +
             body
+        ).toByteArray(Charsets.UTF_8))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open rejects chunked when it is not the final transfer coding`() {
+        stubResponse((
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Transfer-Encoding: chunked, gzip\r\n" +
+            "\r\n" +
+            "b\r\n{\"ok\":true}\r\n0\r\n\r\n"
+        ).toByteArray(Charsets.UTF_8))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open uses chunked framing instead of a conflicting Content-Length`() {
+        // A proxy may leave both headers. Transfer-Encoding is authoritative, so the deliberately
+        // wrong Content-Length must not truncate the chunked body or desynchronise the stream.
+        stubResponse((
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
+            "Content-Length: 1\r\n" +
+            "\r\n" +
+            "b\r\n{\"ok\":true}\r\n0\r\n\r\n"
         ).toByteArray(Charsets.UTF_8))
 
         val cs = ClientSocket(mockTracer)

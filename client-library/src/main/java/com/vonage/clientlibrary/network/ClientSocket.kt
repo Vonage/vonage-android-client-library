@@ -75,7 +75,10 @@ internal class ClientSocket constructor(
                     // Open a new connection when the authority (host:port) changes or on the first
                     // request. A matching authority is necessary but not sufficient: the socket is
                     // only reusable if the previous hop left it open and fully framed.
-                    val reusingConnection = (nurlAuthority == connectedAuthority) && connectionKeptAlive
+                    val reusingConnection =
+                        nurl.protocol.equals("https", ignoreCase = true) &&
+                            nurlAuthority == connectedAuthority &&
+                            connectionKeptAlive
                     if (!reusingConnection) {
                         if (connectedAuthority != null) stopConnection()
                         startConnection(nurl, remainingMs)
@@ -92,12 +95,23 @@ internal class ClientSocket constructor(
                     // Request keep-alive so the server leaves the TCP+TLS socket open for a
                     // following same-authority redirect. Whether we then reuse it is decided by
                     // connectionKeptAlive below.
-                    val attemptResult = runCatching {
-                        sendCommand(nurl, hopHeaders, hopOperator, hopCookies, requestId, keepAlive = true)
+                    var attemptResponse: ResultHandler? = null
+                    var attemptException: Exception? = null
+                    try {
+                        attemptResponse = sendCommand(
+                            nurl,
+                            hopHeaders,
+                            hopOperator,
+                            hopCookies,
+                            requestId,
+                            keepAlive = true
+                        )
+                    } catch (ex: Exception) {
+                        attemptException = ex
                     }
-                    val attemptStatus = attemptResult.getOrNull()?.getHttpStatus()
-                    if (attemptResult.isSuccess && attemptStatus != null && attemptStatus in HTTP_STATUS_RANGE) {
-                        hopResult = attemptResult.getOrThrow()
+                    val attemptStatus = attemptResponse?.getHttpStatus()
+                    if (attemptException == null && attemptStatus != null && attemptStatus in FINAL_HTTP_STATUS_RANGE) {
+                        hopResult = attemptResponse
                         break
                     }
 
@@ -114,8 +128,8 @@ internal class ClientSocket constructor(
                     }
 
                     // A fresh connection failing is a real error; report it as before.
-                    attemptResult.exceptionOrNull()?.let { throw it }
-                    hopResult = attemptResult.getOrNull()
+                    attemptException?.let { throw it }
+                    hopResult = attemptResponse
                     break
                 }
                 result = hopResult
@@ -175,7 +189,7 @@ internal class ClientSocket constructor(
         // A status outside the HTTP range means no status line was ever parsed — the peer closed
         // the connection without sending a response. Report that as an error instead of leaking
         // the uninitialised 0 into the success shape, where callers checking for "error" miss it.
-        if (res.getHttpStatus() !in HTTP_STATUS_RANGE) {
+        if (res.getHttpStatus() !in FINAL_HTTP_STATUS_RANGE) {
             return convertError("sdk_connection_error", "No HTTP response received from server")
         }
         var json: JSONObject = JSONObject()
@@ -230,64 +244,67 @@ internal class ClientSocket constructor(
     private fun sendAndReceive(request: String): ResponseHandler? {
         if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Client sending \n$request\n")
         try {
-            val bytesOfRequest: ByteArray =
-                request.toByteArray(Charset.forName(StandardCharsets.UTF_8.name()))
+            val bytesOfRequest = request.toByteArray(StandardCharsets.UTF_8)
             output.write(bytesOfRequest)
             output.flush()
         } catch (ex: Exception) {
             tracer.addDebug(Log.ERROR, TAG, "Client sending exception : ${ex.message}")
             throw ex
         }
-        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Response " + "\n")
-        var status: Int = 0
-        var body: String = String()
-        var result: ResponseHandler? = null
-        var chunked: Boolean = false
+        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Response\n")
+
         try {
-            var response: String? = readMultipleBytes(rawInput, 65536)
-            if (isDebuggable) {
-                tracer.addDebug(Log.DEBUG, TAG, "$response \n")
-                tracer.addDebug(Log.DEBUG, TAG, "--------" + "\n")
-            }
-            response?.let {
-                val lines = response.split("\n")
-                for (line in lines) {
-                    if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, line)
-                    tracer.addTrace(line)
-                    if (line.startsWith("HTTP/")) {
-                        val parts = line.split(" ")
-                        if (parts.isNotEmpty() && parts.size >= 2) {
-                            status = Integer.valueOf(parts[1].trim())
-                            if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Status - $status")
+            while (true) {
+                val statusLine = readHttpLine(rawInput)
+                    ?: throw IOException("No final HTTP response received")
+                if (!statusLine.startsWith("HTTP/")) {
+                    throw IOException("Malformed HTTP status line: $statusLine")
+                }
+                val parts = statusLine.split(" ")
+                val status = parts.getOrNull(1)?.trim()?.toIntOrNull()
+                    ?: throw IOException("Malformed HTTP status line: $statusLine")
+                if (status !in HTTP_STATUS_RANGE) throw IOException("Invalid HTTP status: $status")
+
+                var contentLength = -1
+                val transferCodings: MutableList<String> = mutableListOf()
+                while (true) {
+                    val header = readHttpLine(rawInput)
+                        ?: throw IOException("Connection closed before response headers completed")
+                    if (header.isEmpty()) break
+                    when {
+                        header.startsWith("Content-Length:", ignoreCase = true) -> {
+                            contentLength = header.substringAfter(':').trim().toIntOrNull()
+                                ?: throw IOException("Invalid Content-Length")
                         }
-                    } else if (line.startsWith("Transfer-Encoding:")) {
-                        var parts = line.split(" ")
-                        if (!parts.isEmpty() && parts.size > 1) {
-                            if (parts[1].contains("chunked")) chunked = true
+                        header.startsWith("Transfer-Encoding:", ignoreCase = true) -> {
+                            transferCodings += header.substringAfter(':')
+                                .split(',')
+                                .map { it.trim().lowercase() }
+                                .filter { it.isNotEmpty() }
                         }
-                    } else if (line.contains(": ") && body.isEmpty()) {
-                        // do nothing
-                    } else {
-                        body += line.replace("\r", "")
-                        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Adding to body - $body\n")
                     }
                 }
-                if (chunked && !body.isNullOrBlank()) {
-                    val r1: Int = body.indexOf("{")
-                    val r2: Int = body.lastIndexOf("}")
-                    if (r1 in 1 until r2) {
-                        body = body.substring(r1, r2 + 1)
-                    }
+
+                if (status == 101) throw IOException("Unexpected protocol upgrade (101 Switching Protocols)")
+                if (status in 100..199) {
+                    tracer.addTrace("Informational POST response received; awaiting final response\n")
+                    continue
                 }
-                if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Status - $status [$chunked]\nBody - $body\n")
-                result = ResponseHandler(status, body)
-                httpLogger.logResponse(status, null, body)
+
+                val usesChunked = usesSupportedChunkedTransfer(transferCodings)
+                val responseBody = when {
+                    !responseCanHaveBody(status) -> null
+                    usesChunked -> readChunkedBody(rawInput)
+                    contentLength >= 0 -> readFixedLengthBody(rawInput, contentLength)
+                    else -> readMultipleBytes(rawInput, 65536)
+                }
+                httpLogger.logResponse(status, null, responseBody)
+                return ResponseHandler(status, responseBody)
             }
         } catch (ex: Exception) {
             tracer.addDebug(Log.ERROR, TAG, "Client reading exception : ${ex.message}")
             throw ex
         }
-        return result
     }
 
     fun post(url: URL, headers: Map<String, String>, body: String?): JSONObject {
@@ -473,9 +490,11 @@ internal class ClientSocket constructor(
         var redirectResult: ResultHandler? = null
         var bodyBegin: Boolean = false
         var contentLength: Int = -1
-        var chunked: Boolean = false
+        val transferCodings: MutableList<String> = mutableListOf()
         var earlyRedirect: Boolean = false
         var mustClose: Boolean = false
+        var validStatusLineSeen = false
+        var finalHeadersComplete = false
         // HTTP/1.0 and earlier are not persistent unless the peer opts in with
         // "Connection: keep-alive". Track both so reuse is never assumed.
         var legacyHttpVersion: Boolean = false
@@ -498,7 +517,7 @@ internal class ClientSocket constructor(
                             // frame, route or annotate the final response; only connection-scoped
                             // state (mustClose) carries over.
                             contentLength = -1
-                            chunked = false
+                            transferCodings.clear()
                             type = ""
                             redirectResult = null
                             earlyRedirect = false
@@ -506,11 +525,16 @@ internal class ClientSocket constructor(
                             trackingHeaders.clear()
                         }
                         val parts = line.split(" ")
-                        if (parts.size >= 2) {
-                            status = parts[1].trim().toIntOrNull() ?: 0
-                            if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Status - $status")
-                            tracer.addTrace("Status - $status ${DateUtils.now()}\n")
+                        if (parts.size < 2) throw IOException("Malformed HTTP status line: $line")
+                        status = parts[1].trim().toIntOrNull()
+                            ?: throw IOException("Malformed HTTP status line: $line")
+                        if (status !in HTTP_STATUS_RANGE) {
+                            throw IOException("Invalid HTTP status: $status")
                         }
+                        validStatusLineSeen = true
+                        finalHeadersComplete = false
+                        if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Status - $status")
+                        tracer.addTrace("Status - $status ${DateUtils.now()}\n")
                         val version = parts[0].trim().substringAfter('/', "")
                         val major = version.substringBefore('.').toIntOrNull() ?: 1
                         val minor = version.substringAfter('.', "0").toIntOrNull() ?: 0
@@ -552,13 +576,10 @@ internal class ClientSocket constructor(
                         }
                     }
                     line.startsWith("Transfer-Encoding:", ignoreCase = true) -> {
-                        // Compare codings as exact tokens: a substring match would send
-                        // "x-chunked" — a different transfer-coding — into the chunk decoder.
-                        val codings = line.substringAfter(':').split(',').map { it.trim() }
-                        if (codings.any { it.equals("chunked", ignoreCase = true) }) {
-                            chunked = true
-                            if (isDebuggable) tracer.addDebug(Log.DEBUG, TAG, "Transfer-Encoding: chunked")
-                        }
+                        transferCodings += line.substringAfter(':')
+                            .split(',')
+                            .map { it.trim().lowercase() }
+                            .filter { it.isNotEmpty() }
                     }
                     line.startsWith("Connection:", ignoreCase = true) -> {
                         // The peer is telling us whether this is the last exchange on this socket.
@@ -584,6 +605,9 @@ internal class ClientSocket constructor(
                             tracer.addDebug(Log.DEBUG, TAG, "Operator tracking header: $name=$value")
                         }
                     }
+                    line.isEmpty() && !validStatusLineSeen -> {
+                        throw IOException("HTTP response ended headers without a valid status line")
+                    }
                     line.isEmpty() && status in 100..199 -> {
                         // 101 hands the socket to another protocol. This client never requests an
                         // upgrade, so whatever follows is not HTTP: parsing it would consume
@@ -597,13 +621,14 @@ internal class ClientSocket constructor(
                         tracer.addTrace("Informational response received; awaiting final response\n")
                     }
                     line.isEmpty() && earlyRedirect -> {
+                        finalHeadersComplete = true
+                        val usesChunked = usesSupportedChunkedTransfer(transferCodings)
                         // End of headers on a redirect. Drain the body so the socket stays clean for
                         // reuse, without retaining bytes we are about to discard: the length is
-                        // peer-controlled and buffering it could exhaust the heap. Chunked or a known
-                        // Content-Length can be drained exactly; without either we cannot frame the
-                        // body, so mark the connection to be closed.
+                        // peer-controlled and buffering it could exhaust the heap. Transfer-Encoding
+                        // is authoritative over Content-Length and only plain chunked is supported.
                         when {
-                            chunked -> {
+                            usesChunked -> {
                                 tracer.addTrace("Draining chunked redirect body\n")
                                 drainChunkedBody(rawInput)
                             }
@@ -619,16 +644,19 @@ internal class ClientSocket constructor(
                         break
                     }
                     line.isEmpty() -> {
+                        finalHeadersComplete = true
+                        val usesChunked = usesSupportedChunkedTransfer(transferCodings)
                         // End of headers on a non-redirect response. Read the body deterministically
                         // so a kept-alive socket never blocks waiting for EOF (DEVX-11219).
                         //
                         // Only JSON content types are surfaced to the caller, so decide read-versus-
                         // drain *before* consuming: buffering a peer-controlled non-JSON body just to
-                        // discard it could exhaust the heap. Drains run in constant memory.
+                        // discard it could exhaust the heap. Transfer-Encoding is authoritative over
+                        // Content-Length and unsupported transfer codings are rejected.
                         val keepBody = isJsonType(type)
                         when {
                             !responseCanHaveBody(status) -> {}
-                            chunked ->
+                            usesChunked ->
                                 if (keepBody) bodyBuilder.append(readChunkedBody(rawInput))
                                 else drainChunkedBody(rawInput)
                             contentLength >= 0 ->
@@ -655,6 +683,9 @@ internal class ClientSocket constructor(
             // and stops an interim status leaking to the caller inside the success shape.
             if (status in 100..199) {
                 throw IOException("Connection closed after an informational response; no final response received")
+            }
+            if (!validStatusLineSeen || !finalHeadersComplete || status !in FINAL_HTTP_STATUS_RANGE) {
+                throw IOException("Connection closed before a complete final HTTP response was received")
             }
 
             // An HTTP/1.0 (or earlier) response is not persistent unless the peer explicitly asked
@@ -725,6 +756,17 @@ internal class ClientSocket constructor(
 
     private fun responseCanHaveBody(status: Int): Boolean =
         status != 204 && status != 205 && status != 304
+
+    /**
+     * Transfer-Encoding overrides Content-Length. This raw client supports only the unmodified
+     * chunked coding; accepting another coding would either decode the representation incorrectly
+     * or leave encoded bytes on a socket that might be reused.
+     */
+    private fun usesSupportedChunkedTransfer(codings: List<String>): Boolean {
+        if (codings.isEmpty()) return false
+        if (codings.size == 1 && codings[0] == "chunked") return true
+        throw IOException("Unsupported Transfer-Encoding: ${codings.joinToString(", ")}")
+    }
 
     /**
      * Reads exactly [length] body bytes and decodes them as UTF-8. Bytes are buffered and decoded
@@ -834,17 +876,16 @@ internal class ClientSocket constructor(
         var parts = redirectLine.split("ocation: ")
         if (parts.isNotEmpty() && parts.size > 1) {
             if (parts[1].isBlank()) return null
-            val redirect = parts[1]
-            // some location header are not properly encoded
-            var cleanRedirect = redirect.replace(" ", "+")
+            // Some Location headers are not properly encoded. Resolve relative references against
+            // the current request, then enforce HTTPS on the actual target. startConnection also
+            // rejects non-HTTPS URLs, but this check prevents a same-authority target from ever
+            // reaching the TLS connection-reuse branch.
+            val cleanRedirect = parts[1].replace(" ", "+")
             tracer.addDebug(Log.DEBUG, TAG, "cleanRedirect : $cleanRedirect")
-            if (!cleanRedirect.startsWith("http")) { // relative redirect
-                return ResultHandler(httpStatus, URL(requestURL, cleanRedirect), null, cookies)
-            }
-            val redirectUrl = URL(cleanRedirect)
-            if (requestURL.protocol == "https" && redirectUrl.protocol == "http") {
-                tracer.addDebug(Log.DEBUG, TAG, "Blocked HTTPS-to-HTTP redirect downgrade")
-                tracer.addTrace("Blocked HTTPS-to-HTTP redirect downgrade\n")
+            val redirectUrl = URL(requestURL, cleanRedirect)
+            if (!redirectUrl.protocol.equals("https", ignoreCase = true)) {
+                tracer.addDebug(Log.DEBUG, TAG, "Blocked non-HTTPS redirect: ${redirectUrl.protocol}")
+                tracer.addTrace("Blocked non-HTTPS redirect\n")
                 return null
             }
             tracer.addDebug(Log.DEBUG, TAG, "Found redirect")
@@ -883,15 +924,15 @@ internal class ClientSocket constructor(
 
     @Throws(IOException::class)
     private fun readMultipleBytes(stream: InputStream, length: Int): String? {
-        // DEVX-11222: Loop until EOF — a single read() can return a partial buffer on
-        // slow cellular networks where data trickles in across multiple TCP segments.
-        val sb = StringBuilder()
+        // Loop until EOF for close-delimited bodies, buffering raw bytes and decoding once. Decoding
+        // each read independently corrupts a multibyte UTF-8 sequence split at a buffer boundary.
+        val out = ByteArrayOutputStream()
         val buf = ByteArray(length)
         var bytesRead: Int
         while (stream.read(buf, 0, length).also { bytesRead = it } != -1) {
-            sb.append(String(buf, 0, bytesRead, StandardCharsets.UTF_8))
+            out.write(buf, 0, bytesRead)
         }
-        return sb.toString()
+        return out.toString(StandardCharsets.UTF_8.name())
     }
 
     companion object {
@@ -905,6 +946,7 @@ internal class ClientSocket constructor(
         // on a fresh connection if the reused one turns out to be half-open.
         private const val REUSE_PROBE_BUDGET_DIVISOR: Long = 2
         private val HTTP_STATUS_RANGE = 100..599
+        private val FINAL_HTTP_STATUS_RANGE = 200..599
 
         // Operator-injected tracking headers to capture and log for troubleshooting.
         // Orange uses X-Orange-Trace-Id; Vodafone uses X-VIG-Trace-Id.
