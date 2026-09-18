@@ -13,6 +13,7 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.net.URL
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
@@ -163,6 +164,21 @@ class ClientSocketTest {
         override fun read(): Int {
             if (index < prefix.size) return prefix[index++].toInt() and 0xFF
             throw failure
+        }
+    }
+
+    /** Serves [prefix], then trickles bytes until closing the socket flips [isClosed]. */
+    private class PrefixThenTrickleInputStream(
+        private val prefix: ByteArray,
+        private val isClosed: () -> Boolean
+    ) : InputStream() {
+        private var index = 0
+
+        override fun read(): Int {
+            if (index < prefix.size) return prefix[index++].toInt() and 0xFF
+            Thread.sleep(5)
+            if (isClosed()) throw IOException("socket closed by deadline")
+            return 'x'.code
         }
     }
 
@@ -369,6 +385,7 @@ class ClientSocketTest {
 
         assertEquals("simulated VM failure", thrown.message)
         verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        verify { mockSSLSocket.close() }
     }
 
     @Test
@@ -933,44 +950,21 @@ class ClientSocketTest {
     }
 
     @Test
-    fun `open uses a fresh connection when a redirect body is delimited by connection close`() {
-        // A non-3xx status carrying Location, with no Content-Length and no chunked framing: the
-        // body ends at EOF, so the socket is spent. Asserting only the final 200 is not enough —
-        // that passes even when the socket is wrongly reused and the stale-connection retry covers
-        // for it. Assert the spent socket is never written to a second time.
-        val unframed = (
+    fun `open ignores a Location header on a non-redirect status`() {
+        val response = (
             "HTTP/1.1 200 OK\r\n" +
-            "Location: https://api.example.com/final\r\n" +
-            "Content-Type: text/html\r\n" +
-            "\r\n" +
-            "<html>redirecting</html>"
+            "Location: https://api.example.com/not-a-redirect\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
         ).toByteArray(Charsets.UTF_8)
-
-        val firstOut = ByteArrayOutputStream()
-        val firstSocket = mockk<SSLSocket>(relaxed = true)
-        every { firstSocket.getInputStream() } returns ByteArrayInputStream(unframed)
-        every { firstSocket.getOutputStream() } returns firstOut
-        every { firstSocket.inetAddress } returns mockk(relaxed = true)
-        every { firstSocket.port } returns 443
-
-        val sockets = listOf(firstSocket, makeMockSocket(httpResponse(200, body = """{"ok":true}"""))).iterator()
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
-            if (sockets.hasNext()) sockets.next() else makeMockSocket(ByteArray(0))
-        }
+        stubResponse(response)
 
         val cs = ClientSocket(mockTracer)
         val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
 
-        val firstRequests = firstOut.toString(Charsets.UTF_8.name())
-        assertEquals(
-            "Spent connection must not be written to again: $firstRequests",
-            1,
-            Regex("^GET ", RegexOption.MULTILINE).findAll(firstRequests).count()
-        )
-        verify { firstSocket.close() }
+        verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
         assertFalse("Should not contain error: $result", result.has("error"))
         assertEquals(200, result.getInt("http_status"))
-        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
     }
 
     @Test
@@ -1102,43 +1096,6 @@ class ClientSocketTest {
 
         verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
         assertEquals("sdk_connection_error", result.getString("error"))
-    }
-
-    @Test
-    fun `open uses a fresh connection when a non-redirect response sends Connection close`() {
-        // The close decision must survive the redirectResult path for every reason, not just an
-        // unframed body: here a framed 200 carrying Location also sends "Connection: close".
-        val closing = (
-            "HTTP/1.1 200 OK\r\n" +
-            "Location: https://api.example.com/final\r\n" +
-            "Content-Length: 0\r\n" +
-            "Connection: close\r\n" +
-            "\r\n"
-        ).toByteArray(Charsets.UTF_8)
-
-        val firstOut = ByteArrayOutputStream()
-        val firstSocket = mockk<SSLSocket>(relaxed = true)
-        every { firstSocket.getInputStream() } returns ByteArrayInputStream(closing)
-        every { firstSocket.getOutputStream() } returns firstOut
-        every { firstSocket.inetAddress } returns mockk(relaxed = true)
-        every { firstSocket.port } returns 443
-
-        val sockets = listOf(firstSocket, makeMockSocket(httpResponse(200, body = """{"ok":true}"""))).iterator()
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
-            if (sockets.hasNext()) sockets.next() else makeMockSocket(ByteArray(0))
-        }
-
-        val cs = ClientSocket(mockTracer)
-        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
-
-        val firstRequests = firstOut.toString(Charsets.UTF_8.name())
-        assertEquals(
-            "Closed connection must not be written to again: $firstRequests",
-            1,
-            Regex("^GET ", RegexOption.MULTILINE).findAll(firstRequests).count()
-        )
-        assertEquals(200, result.getInt("http_status"))
-        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
     }
 
     @Test
@@ -1426,6 +1383,285 @@ class ClientSocketTest {
     }
 
     @Test
+    fun `open reuses a connection when redirect host case changes`() {
+        val redirect = (
+            "HTTP/1.1 302 Found\r\n" +
+            "Location: https://API.EXAMPLE.COM/final\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(redirect + httpResponse(200, body = """{"ok":true}"""))
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertEquals(200, result.getInt("http_status"))
+    }
+
+    @Test
+    fun `open discards cookies from informational responses`() {
+        val interim = (
+            "HTTP/1.1 103 Early Hints\r\n" +
+            "Set-Cookie: interim=discard; Domain=api.example.com\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        val redirect = (
+            "HTTP/1.1 302 Found\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        val output = ByteArrayOutputStream()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns output
+        every { mockSSLSocket.getInputStream() } returns
+            ByteArrayInputStream(interim + redirect + httpResponse(200, body = """{"ok":true}"""))
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val cs = ClientSocket(mockTracer)
+        val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        assertEquals(200, result.getInt("http_status"))
+        assertFalse("Interim cookie must not be sent: $output", output.toString().contains("interim=discard"))
+    }
+
+    @Test
+    fun `open rejects conflicting duplicate Content-Length headers`() {
+        stubResponse((
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Content-Length: 2\r\n" +
+            "Content-Length: 12\r\n" +
+            "\r\n" +
+            "{}"
+        ).toByteArray(Charsets.UTF_8))
+
+        val result = ClientSocket(mockTracer).open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open accepts identical duplicate Content-Length headers`() {
+        val body = """{"ok":true}"""
+        stubResponse((
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Content-Length: ${body.toByteArray().size}\r\n" +
+            "Content-Length: ${body.toByteArray().size}\r\n" +
+            "\r\n" +
+            body
+        ).toByteArray(Charsets.UTF_8))
+
+        val result = ClientSocket(mockTracer).open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertFalse("Should not contain error: $result", result.has("error"))
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open consumes a zero chunk on a 205 response`() {
+        val input = ByteArrayInputStream((
+            "HTTP/1.1 205 Reset Content\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
+            "\r\n" +
+            "0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8))
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns input
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val result = ClientSocket(mockTracer).open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals(205, result.getInt("http_status"))
+        assertEquals("Zero chunk must be consumed", 0, input.available())
+    }
+
+    @Test
+    fun `open rejects nonzero chunk data on a 205 response`() {
+        stubResponse((
+            "HTTP/1.1 205 Reset Content\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
+            "\r\n" +
+            "1\r\nx\r\n0\r\n\r\n"
+        ).toByteArray(Charsets.UTF_8))
+
+        val result = ClientSocket(mockTracer).open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open treats 304 with Location as a bodyless final response`() {
+        stubResponse((
+            "HTTP/1.1 304 Not Modified\r\n" +
+            "Location: https://api.example.com/not-a-redirect\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8))
+
+        val result = ClientSocket(mockTracer).open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertEquals(304, result.getInt("http_status"))
+    }
+
+    @Test
+    fun `open rejects a valid fixed-length JSON body over 10 MiB`() {
+        val totalLength = 10L * 1024 * 1024 + 1
+        val prefix = "{\"v\":\"".toByteArray(Charsets.UTF_8)
+        val suffix = "\"}".toByteArray(Charsets.UTF_8)
+        val headerAndPrefix = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Content-Length: $totalLength\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8) + prefix
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns LargeBodyInputStream(
+            headerAndPrefix,
+            totalLength - prefix.size - suffix.size,
+            suffix
+        )
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val result = ClientSocket(mockTracer).open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open rejects a valid chunked JSON body over 10 MiB`() {
+        val totalLength = 10L * 1024 * 1024 + 1
+        val prefix = "{\"v\":\"".toByteArray(Charsets.UTF_8)
+        val suffixAndTerminator = "\"}\r\n0\r\n\r\n".toByteArray(Charsets.UTF_8)
+        val headerChunkAndPrefix = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
+            "\r\n" +
+            "${totalLength.toString(16)}\r\n"
+        ).toByteArray(Charsets.UTF_8) + prefix
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns LargeBodyInputStream(
+            headerChunkAndPrefix,
+            totalLength - prefix.size - 2,
+            suffixAndTerminator
+        )
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val result = ClientSocket(mockTracer).open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open rejects a valid close-delimited JSON body over 10 MiB`() {
+        val totalLength = 10L * 1024 * 1024 + 1
+        val prefix = "{\"v\":\"".toByteArray(Charsets.UTF_8)
+        val suffix = "\"}".toByteArray(Charsets.UTF_8)
+        val headerAndPrefix = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Connection: close\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8) + prefix
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { mockSSLSocket.getInputStream() } returns LargeBodyInputStream(
+            headerAndPrefix,
+            totalLength - prefix.size - suffix.size,
+            suffix
+        )
+        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
+        every { mockSSLSocket.port } returns 443
+
+        val result = ClientSocket(mockTracer).open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open parses Content-Type case and compact parameters`() {
+        val body = """{"ok":true}"""
+        stubResponse((
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: Application/JSON;charset=utf-8\r\n" +
+            "Content-Length: ${body.toByteArray().size}\r\n" +
+            "\r\n" +
+            body
+        ).toByteArray(Charsets.UTF_8))
+
+        val result = ClientSocket(mockTracer).open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertTrue(result.getJSONObject("response_body").getBoolean("ok"))
+    }
+
+    @Test
+    fun `open does not retry a response parsing failure on a reused connection`() {
+        val redirect = (
+            "HTTP/1.1 302 Found\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        val malformed = "plain text"
+        val finalResponse = (
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Content-Length: ${malformed.length}\r\n" +
+            "\r\n" +
+            malformed
+        ).toByteArray(Charsets.UTF_8)
+        stubResponse(redirect + finalResponse)
+
+        val result = ClientSocket(mockTracer).open(URL("https://api.example.com/start"), emptyMap(), null, 5)
+
+        verify(exactly = 1) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open enforces an absolute deadline on a trickling reused connection and retries`() {
+        val redirect = (
+            "HTTP/1.1 302 Found\r\n" +
+            "Location: https://api.example.com/final\r\n" +
+            "Content-Length: 0\r\n" +
+            "\r\n"
+        ).toByteArray(Charsets.UTF_8)
+        val firstClosed = AtomicBoolean(false)
+        val firstSocket = mockk<SSLSocket>(relaxed = true)
+        every { firstSocket.getOutputStream() } returns ByteArrayOutputStream()
+        every { firstSocket.getInputStream() } returns PrefixThenTrickleInputStream(redirect) { firstClosed.get() }
+        every { firstSocket.inetAddress } returns mockk(relaxed = true)
+        every { firstSocket.port } returns 443
+        every { firstSocket.close() } answers { firstClosed.set(true) }
+
+        val freshSocket = makeMockSocket(httpResponse(200, body = """{"ok":true}"""))
+        val sockets = listOf(firstSocket, freshSocket).iterator()
+        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers { sockets.next() }
+
+        val started = System.currentTimeMillis()
+        val result = ClientSocket(mockTracer, globalDeadlineMs = 500).open(
+            URL("https://api.example.com/start"), emptyMap(), null, 5
+        )
+        val elapsed = System.currentTimeMillis() - started
+
+        verify(exactly = 2) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        assertFalse("Deadline retry should recover: $result", result.has("error"))
+        assertEquals(200, result.getInt("http_status"))
+        assertTrue("Absolute deadline should bound trickling reads, elapsed=$elapsed", elapsed < 1_000)
+    }
+
+    @Test
     fun `open does not reuse connection when redirect changes port`() {        val redirectResponse = (
             "HTTP/1.1 301 Moved Permanently\r\n" +
             "Location: https://api.example.com:8443/other\r\n" +
@@ -1467,6 +1703,20 @@ class ClientSocketTest {
             "Location: /new",
             null
         )
+        assertNotNull(result)
+        assertEquals("https://api.example.com/new", result!!.getRedirect()?.toString())
+    }
+
+    @Test
+    fun `parseRedirect handles a lowercase Location header`() {
+        val cs = ClientSocket(mockTracer)
+        val result = cs.parseRedirect(
+            302,
+            URL("https://api.example.com/old"),
+            "location:/new",
+            null
+        )
+
         assertNotNull(result)
         assertEquals("https://api.example.com/new", result!!.getRedirect()?.toString())
     }
