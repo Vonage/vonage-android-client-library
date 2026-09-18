@@ -1,0 +1,16 @@
+client-library/src/main/java/com/vonage/clientlibrary/network/ClientSocket.kt
+  h_b0b759f4c5cf9e 11,15,17,23-24,27-28,46,60,88,93,95-99,109-118,121-128,139-142,175,281,285-286,296-301,312,318-322,324-329,539,561,564,566,568,594-599,603-607,611-614,616-617,650,657,690-698,700-702,808,816-818,853-866,894-895,904-906,915,936-937,942,957-1002,1019-1021,1041-1043,1059-1061,1064
+client-library/src/test/java/com/vonage/clientlibrary/network/ClientSocketTest.kt
+  h_b0b759f4c5cf9e 16,170-184,388,953-954,956-958,960,965,1385-1663,1708-1721
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "690be123c4aa716b49baece83e49233fa3403a7d",
+  "prompts": {},
+  "humans": {
+    "h_b0b759f4c5cf9e": {
+      "author": "Chris Tankersley <chris@ctankersley.com>"
+    }
+  }
+}
