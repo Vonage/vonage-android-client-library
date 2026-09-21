@@ -11,7 +11,7 @@ A library to support using the Vonage APIs on Android. Features:
 build.gradle -> dependencies add
 
 ```
-implementation 'com.vonage:client-library:1.3.0'
+implementation 'com.vonage:client-library:1.3.1'
 ```
 
 > **Silent Auth Advanced** is available as of `1.3.0`. Its API is still experimental and may change in a future release.
