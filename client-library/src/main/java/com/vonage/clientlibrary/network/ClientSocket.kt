@@ -624,11 +624,6 @@ internal class ClientSocket constructor(
                 return ResultHandler(httpStatus, URL(requestURL, cleanRedirect), null, cookies)
             }
             val redirectUrl = URL(cleanRedirect)
-            if (requestURL.protocol == "https" && redirectUrl.protocol == "http") {
-                tracer.addDebug(Log.DEBUG, TAG, "Blocked HTTPS-to-HTTP redirect downgrade")
-                tracer.addTrace("Blocked HTTPS-to-HTTP redirect downgrade\n")
-                return null
-            }
             tracer.addDebug(Log.DEBUG, TAG, "Found redirect")
             tracer.addTrace("Found redirect - ${DateUtils.now()} \n")
             return ResultHandler(httpStatus, redirectUrl, null, cookies)
