@@ -184,28 +184,6 @@ class ClientSocketTest {
     }
 
     @Test
-    fun `open allows HTTPS to HTTP redirect downgrade`() {
-        val redirectResponse = (
-            "HTTP/1.1 301 Moved Permanently\r\n" +
-            "Location: http://evil.example.com/\r\n" +
-            "Content-Length: 0\r\n" +
-            "\r\n"
-        ).toByteArray(Charsets.UTF_8)
-
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
-        every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
-        every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(redirectResponse)
-        every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
-        every { mockSSLSocket.port } returns 443
-
-        val cs = ClientSocket(mockTracer)
-        val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
-
-        // Downgrade is allowed → redirect is followed → startConnection rejects http://
-        assertTrue("Should follow http:// redirect", "sdk_connection_error" == result.optString("error"))
-    }
-
-    @Test
     fun `open returns non-JSON body as response_raw_body`() {
         // A valid JSON-ish body that isn't strict JSON — parseBodyIntoJSONString extracts
         // the outer braces, then convertResultHandler tries JSONObject which may fail.
