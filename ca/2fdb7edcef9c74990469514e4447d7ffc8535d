@@ -1,0 +1,14 @@
+client-library/src/main/java/com/vonage/clientlibrary/network/ClientSocket.kt
+  h_9f893a8b174200 57,107,362,368-386,388,684-686
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ca2fdb7edcef9c74990469514e4447d7ffc8535d",
+  "prompts": {},
+  "humans": {
+    "h_9f893a8b174200": {
+      "author": "Andrei Nemes <andrei.nemes@vonage.com>"
+    }
+  }
+}
