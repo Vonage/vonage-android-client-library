@@ -54,7 +54,7 @@ internal class ClientSocket constructor(
             if (remainingMs <= 0)
                 return convertError("sdk_timeout_error", "Operation deadline exceeded")
 
-            val nurlAuthority = "${nurl.host}:${if (nurl.port > 0) nurl.port else PORT_443}"
+            val nurlAuthority = "${nurl.host}:${if (nurl.port > 0) nurl.port else defaultPort(nurl.protocol)}"
 
             try {
                 // Reuse the existing TCP+TLS connection for same-host redirects (DEVX-11219).
@@ -104,7 +104,7 @@ internal class ClientSocket constructor(
                 // next redirect goes to a different authority.
                 if (connectedAuthority != null &&
                     (redirectURL == null ||
-                     "${redirectURL!!.host}:${if (redirectURL!!.port > 0) redirectURL!!.port else PORT_443}" != connectedAuthority)) {
+                     "${redirectURL!!.host}:${if (redirectURL!!.port > 0) redirectURL!!.port else defaultPort(redirectURL!!.protocol)}" != connectedAuthority)) {
                     stopConnection()
                     connectedAuthority = null
                     connectionKeptAlive = false
@@ -359,30 +359,33 @@ internal class ClientSocket constructor(
     }
 
     private fun startConnection(url: URL, timeoutMs: Long = 5_000) {
-        if (url.protocol != "https") {
-            throw IOException("Only HTTPS URLs are supported. Received: ${url.protocol}://")
-        }
-        var port = PORT_443
-        if (url.port > 0) port = url.port
+        val port = if (url.port > 0) url.port else defaultPort(url.protocol)
 
         httpLogger.logConnection("Opening", url.host, port)
 
         tracer.addDebug(Log.DEBUG, TAG, "start : ${url.host} ${url.port} ${url.protocol}")
         tracer.addTrace("\nStart connection ${url.host} ${url.port} ${url.protocol} ${DateUtils.now()}\n")
-        val sslSocket = SSLSocketFactory.getDefault().createSocket(url.host, port) as SSLSocket
-        try {
-            sslSocket.soTimeout = timeoutMs.coerceAtLeast(1L).toInt()
-            val params = sslSocket.sslParameters
-            params.endpointIdentificationAlgorithm = "HTTPS"
-            sslSocket.sslParameters = params
-            sslSocket.startHandshake()
-            socket = sslSocket
-        } catch (ex: Exception) {
-            tracer.addDebug(Log.ERROR, TAG, "Cannot create socket exception : ${ex.message}")
-            tracer.addTrace("Cannot create socket exception ${ex.message}\n")
-            runCatching { sslSocket.close() }
-            throw ex
+        val newSocket: Socket = if (url.protocol == "https") {
+            val sslSocket = SSLSocketFactory.getDefault().createSocket(url.host, port) as SSLSocket
+            try {
+                sslSocket.soTimeout = timeoutMs.coerceAtLeast(1L).toInt()
+                val params = sslSocket.sslParameters
+                params.endpointIdentificationAlgorithm = "HTTPS"
+                sslSocket.sslParameters = params
+                sslSocket.startHandshake()
+            } catch (ex: Exception) {
+                tracer.addDebug(Log.ERROR, TAG, "Cannot create socket exception : ${ex.message}")
+                tracer.addTrace("Cannot create socket exception ${ex.message}\n")
+                runCatching { sslSocket.close() }
+                throw ex
+            }
+            sslSocket
+        } else {
+            val plainSocket = Socket(url.host, port)
+            plainSocket.soTimeout = timeoutMs.coerceAtLeast(1L).toInt()
+            plainSocket
         }
+        socket = newSocket
         return try {
             tracer.addDebug(
                 Log.DEBUG,
@@ -624,11 +627,6 @@ internal class ClientSocket constructor(
                 return ResultHandler(httpStatus, URL(requestURL, cleanRedirect), null, cookies)
             }
             val redirectUrl = URL(cleanRedirect)
-            if (requestURL.protocol == "https" && redirectUrl.protocol == "http") {
-                tracer.addDebug(Log.DEBUG, TAG, "Blocked HTTPS-to-HTTP redirect downgrade")
-                tracer.addTrace("Blocked HTTPS-to-HTTP redirect downgrade\n")
-                return null
-            }
             tracer.addDebug(Log.DEBUG, TAG, "Found redirect")
             tracer.addTrace("Found redirect - ${DateUtils.now()} \n")
             return ResultHandler(httpStatus, redirectUrl, null, cookies)
@@ -683,6 +681,9 @@ internal class ClientSocket constructor(
         private const val PORT_443 = 443
         private const val CRLF = "\r\n"
         private const val GLOBAL_DEADLINE_MS: Long = 30_000
+
+        private fun defaultPort(protocol: String): Int =
+            if (protocol == "https") PORT_443 else PORT_80
         private val HTTP_STATUS_RANGE = 100..599
 
         // Operator-injected tracking headers to capture and log for troubleshooting.
