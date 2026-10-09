@@ -10,7 +10,13 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.net.InetSocketAddress
+import java.net.SocketTimeoutException
 import java.net.URL
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLException
+import javax.net.ssl.SSLHandshakeException
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
@@ -46,9 +52,25 @@ class ClientSocketTest {
     // Helpers
     // ------------------------------------------------------------------
 
+    /** ClientSocket that skips real DNS: hosts are left unresolved for the mocked socket. */
+    private fun newClientSocket() =
+        ClientSocket(mockTracer, resolveAddress = InetSocketAddress::createUnresolved)
+
+    /**
+     * Runs [block] on a worker thread. Robolectric runs tests on the main thread, where
+     * ClientSocket resolves DNS inline, so the bounded-DNS path is only exercised off it.
+     */
+    private fun <T> offMainThread(block: () -> T): T {
+        var result: Result<T>? = null
+        val t = Thread { result = runCatching(block) }
+        t.start()
+        t.join(30_000)
+        return result!!.getOrThrow()
+    }
+
     /** Wire up the mock SSLSocket to return the given HTTP response bytes. */
     private fun stubResponse(responseBytes: ByteArray) {
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocketFactory.createSocket() } returns mockSSLSocket
         every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
         every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(responseBytes)
         every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
@@ -96,7 +118,7 @@ class ClientSocketTest {
     fun `open returns http_status and response_body for 200 JSON response`() {
         stubResponse(httpResponse(200, body = """{"ok":true}"""))
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         assertFalse("Should not contain error", result.has("error"))
@@ -106,10 +128,10 @@ class ClientSocketTest {
 
     @Test
     fun `open returns sdk_connection_error when socket factory throws`() {
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } throws
+        every { mockSSLSocketFactory.createSocket() } throws
             RuntimeException("Network unreachable")
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         assertEquals("sdk_connection_error", result.getString("error"))
@@ -118,13 +140,13 @@ class ClientSocketTest {
 
     @Test
     fun `open returns sdk_connection_error and closes socket when exception occurs after connection`() {
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocketFactory.createSocket() } returns mockSSLSocket
         every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
         every { mockSSLSocket.getInputStream() } throws RuntimeException("Read failed")
         every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
         every { mockSSLSocket.port } returns 443
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         assertEquals("sdk_connection_error", result.getString("error"))
@@ -146,13 +168,13 @@ class ClientSocketTest {
         // 7 redirects in sequence — more than maxRedirectCount=5
         val combined = (1..7).fold(ByteArray(0)) { acc, _ -> acc + singleRedirect }
 
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocketFactory.createSocket() } returns mockSSLSocket
         every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
         every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(combined)
         every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
         every { mockSSLSocket.port } returns 443
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
 
         assertTrue("Expected error in result: $result", result.has("error"))
@@ -171,11 +193,11 @@ class ClientSocketTest {
 
         // First createSocket → redirect response; second → final response
         val responses = listOf(redirectResponse, finalResponse).iterator()
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+        every { mockSSLSocketFactory.createSocket() } answers {
             makeMockSocket(if (responses.hasNext()) responses.next() else finalResponse)
         }
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
 
         assertFalse(result.has("error"))
@@ -197,13 +219,13 @@ class ClientSocketTest {
             "\r\n" +
             nonJsonBody
         ).toByteArray(Charsets.UTF_8)
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocketFactory.createSocket() } returns mockSSLSocket
         every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
         every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(response)
         every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
         every { mockSSLSocket.port } returns 443
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         // parseBodyIntoJSONString throws on no '{' → caught as sdk_connection_error
@@ -221,13 +243,13 @@ class ClientSocketTest {
             "\r\n" +
             nonJsonBody
         ).toByteArray(Charsets.UTF_8)
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocketFactory.createSocket() } returns mockSSLSocket
         every { mockSSLSocket.getOutputStream() } returns ByteArrayOutputStream()
         every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(response)
         every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
         every { mockSSLSocket.port } returns 443
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         assertFalse(result.has("error"))
@@ -254,12 +276,12 @@ class ClientSocketTest {
         // redirect reuses that socket it reads nothing and no status line is ever parsed.
         val opened = mutableListOf<SSLSocket>()
         val responses = listOf(redirectResponse, finalResponse).iterator()
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+        every { mockSSLSocketFactory.createSocket() } answers {
             makeMockSocket(if (responses.hasNext()) responses.next() else ByteArray(0))
                 .also { opened.add(it) }
         }
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
 
         assertEquals("Same-host redirect must get a fresh connection", 2, opened.size)
@@ -275,7 +297,7 @@ class ClientSocketTest {
         // success shape, where a caller checking for "error" would treat it as a good response.
         stubResponse(ByteArray(0))
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         val result = cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         assertEquals("sdk_connection_error", result.getString("error"))
@@ -299,14 +321,14 @@ class ClientSocketTest {
         val finalResponse = httpResponse(200, body = """{"ok":true}""")
 
         val responses = listOf(redirectResponse, finalResponse).iterator()
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+        every { mockSSLSocketFactory.createSocket() } answers {
             makeMockSocket(if (responses.hasNext()) responses.next() else ByteArray(0))
         }
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         val result = cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
 
-        verify(exactly = 2) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        verify(exactly = 2) { mockSSLSocketFactory.createSocket() }
         assertEquals(200, result.getInt("http_status"))
     }
 
@@ -321,20 +343,20 @@ class ClientSocketTest {
         val finalResponse = httpResponse(200, body = """{"ok":true}""")
 
         val responses = listOf(redirectResponse, finalResponse).iterator()
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } answers {
+        every { mockSSLSocketFactory.createSocket() } answers {
             makeMockSocket(if (responses.hasNext()) responses.next() else finalResponse)
         }
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         cs.open(URL("https://api.example.com/start"), emptyMap(), null, 5)
 
         // Different authority (port changed) → two separate connections
-        verify(exactly = 2) { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) }
+        verify(exactly = 2) { mockSSLSocketFactory.createSocket() }
     }
 
     @Test
     fun `parseRedirect allows HTTPS to HTTP redirect`() {
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         val result = cs.parseRedirect(
             301,
             URL("https://api.example.com/"),
@@ -347,7 +369,7 @@ class ClientSocketTest {
 
     @Test
     fun `parseRedirect handles relative redirect`() {
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         val result = cs.parseRedirect(
             302,
             URL("https://api.example.com/old"),
@@ -360,7 +382,7 @@ class ClientSocketTest {
 
     @Test
     fun `parseBodyIntoJSONString extracts JSON object from body string`() {
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         val json = cs.parseBodyIntoJSONString("""prefix{"key":"value"}suffix""")
         assertEquals("""{"key":"value"}""", json)
     }
@@ -379,13 +401,13 @@ class ClientSocketTest {
         val combined = redirect + finalResponse
 
         val outputStream = ByteArrayOutputStream()
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocketFactory.createSocket() } returns mockSSLSocket
         every { mockSSLSocket.getOutputStream() } returns outputStream
         every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(combined)
         every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
         every { mockSSLSocket.port } returns 443
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         val sentRequests = outputStream.toString(Charsets.UTF_8)
@@ -406,13 +428,13 @@ class ClientSocketTest {
         val combined = redirect + finalResponse
 
         val outputStream = ByteArrayOutputStream()
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocketFactory.createSocket() } returns mockSSLSocket
         every { mockSSLSocket.getOutputStream() } returns outputStream
         every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(combined)
         every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
         every { mockSSLSocket.port } returns 443
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         val sentRequests = outputStream.toString(Charsets.UTF_8)
@@ -433,17 +455,156 @@ class ClientSocketTest {
         val combined = redirect + finalResponse
 
         val outputStream = ByteArrayOutputStream()
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returns mockSSLSocket
+        every { mockSSLSocketFactory.createSocket() } returns mockSSLSocket
         every { mockSSLSocket.getOutputStream() } returns outputStream
         every { mockSSLSocket.getInputStream() } returns ByteArrayInputStream(combined)
         every { mockSSLSocket.inetAddress } returns mockk(relaxed = true)
         every { mockSSLSocket.port } returns 443
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         val sentRequests = outputStream.toString(Charsets.UTF_8)
         assertFalse("Cookie for wrong domain should not be sent", sentRequests.contains("Cookie: session=nope"))
+    }
+
+    // ------------------------------------------------------------------
+    // DEVX-11635: TLS handshake timeout
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `open returns sdk_tls_handshake_timeout when TCP connect times out`() {
+        stubResponse(ByteArray(0))
+        every { mockSSLSocket.connect(any(), any()) } throws SocketTimeoutException("connect timed out")
+
+        val result = newClientSocket().open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_tls_handshake_timeout", result.getString("error"))
+        verify { mockSSLSocket.close() }
+    }
+
+    @Test
+    fun `open returns sdk_tls_handshake_timeout when TLS handshake times out`() {
+        stubResponse(ByteArray(0))
+        every { mockSSLSocket.startHandshake() } throws SocketTimeoutException("Read timed out")
+
+        val result = newClientSocket().open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_tls_handshake_timeout", result.getString("error"))
+        assertTrue(result.getString("error_description").contains("api.example.com"))
+        verify { mockSSLSocket.close() }
+    }
+
+    @Test
+    fun `open treats a handshake timeout wrapped in SSLException as a handshake timeout`() {
+        stubResponse(ByteArray(0))
+        every { mockSSLSocket.startHandshake() } throws
+            SSLException("handshake failed", SocketTimeoutException("Read timed out"))
+
+        val result = newClientSocket().open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_tls_handshake_timeout", result.getString("error"))
+    }
+
+    @Test
+    fun `open keeps sdk_connection_error for non-timeout handshake failures`() {
+        stubResponse(ByteArray(0))
+        every { mockSSLSocket.startHandshake() } throws SSLHandshakeException("bad certificate")
+
+        val result = newClientSocket().open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
+    }
+
+    @Test
+    fun `open bounds the TCP connect by the configured handshake timeout`() {
+        stubResponse(httpResponse(200, body = """{"ok":true}"""))
+
+        newClientSocket().open(URL("https://api.example.com/"), emptyMap(), null, 5, handshakeTimeoutMs = 2_000)
+
+        verify { mockSSLSocket.connect(any(), match { it in 1_500..2_000 }) }
+    }
+
+    @Test
+    fun `open uses the 5s default handshake timeout`() {
+        stubResponse(httpResponse(200, body = """{"ok":true}"""))
+
+        newClientSocket().open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        verify { mockSSLSocket.connect(any(), match { it in 4_500..5_000 }) }
+    }
+
+    @Test
+    fun `open returns sdk_tls_handshake_timeout within the window when DNS hangs`() {
+        stubResponse(httpResponse(200, body = """{"ok":true}"""))
+        val release = CountDownLatch(1)
+        val hangingDns: (String, Int) -> InetSocketAddress = { host, port ->
+            release.await(30, TimeUnit.SECONDS) // simulates a resolver that never answers
+            InetSocketAddress.createUnresolved(host, port)
+        }
+        try {
+            val start = System.currentTimeMillis()
+            val result = offMainThread {
+                ClientSocket(mockTracer, resolveAddress = hangingDns)
+                    .open(URL("https://api.example.com/"), emptyMap(), null, 5, handshakeTimeoutMs = 1_000)
+            }
+            val elapsed = System.currentTimeMillis() - start
+
+            assertEquals("sdk_tls_handshake_timeout", result.getString("error"))
+            assertTrue(result.getString("error_description").contains("DNS"))
+            assertTrue("Expected ~1s, took ${elapsed}ms", elapsed in 900..3_000)
+            verify(exactly = 0) { mockSSLSocket.connect(any(), any()) }
+            verify { mockSSLSocket.close() }
+        } finally {
+            release.countDown()
+        }
+    }
+
+    @Test
+    fun `DNS time counts against the same handshake window as the connect`() {
+        stubResponse(httpResponse(200, body = """{"ok":true}"""))
+        val slowDns: (String, Int) -> InetSocketAddress = { host, port ->
+            Thread.sleep(600)
+            InetSocketAddress.createUnresolved(host, port)
+        }
+
+        offMainThread {
+            ClientSocket(mockTracer, resolveAddress = slowDns)
+                .open(URL("https://api.example.com/"), emptyMap(), null, 5, handshakeTimeoutMs = 1_000)
+        }
+
+        // 1000ms window minus ~600ms spent resolving leaves at most ~400ms for the connect.
+        verify { mockSSLSocket.connect(any(), match { it in 1..450 }) }
+    }
+
+    @Test
+    fun `DNS is resolved inline on the main thread instead of waiting on a helper`() {
+        // Android rejects network I/O on the main thread immediately; parking the main thread on
+        // a helper-thread lookup would turn that instant failure into a UI freeze.
+        stubResponse(httpResponse(200, body = """{"ok":true}"""))
+        var resolvedOn: Thread? = null
+        val recordingDns: (String, Int) -> InetSocketAddress = { host, port ->
+            resolvedOn = Thread.currentThread()
+            InetSocketAddress.createUnresolved(host, port)
+        }
+
+        ClientSocket(mockTracer, resolveAddress = recordingDns)
+            .open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertSame(Thread.currentThread(), resolvedOn)
+    }
+
+    @Test
+    fun `open keeps sdk_connection_error when DNS fails fast`() {
+        stubResponse(ByteArray(0))
+        val failingDns: (String, Int) -> InetSocketAddress = { host, _ ->
+            throw java.net.UnknownHostException(host)
+        }
+
+        val result = ClientSocket(mockTracer, resolveAddress = failingDns)
+            .open(URL("https://api.example.com/"), emptyMap(), null, 5)
+
+        assertEquals("sdk_connection_error", result.getString("error"))
     }
 
     // ------------------------------------------------------------------
@@ -457,7 +618,7 @@ class ClientSocketTest {
             body = """{"ok":true}"""
         ))
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         assertEquals("orange-abc-123", cs.lastOperatorTrackingHeaders["X-Orange-Trace-Id"])
@@ -470,7 +631,7 @@ class ClientSocketTest {
             body = """{"ok":true}"""
         ))
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         assertEquals("vodafone-xyz-789", cs.lastOperatorTrackingHeaders["X-VIG-Trace-Id"])
@@ -483,7 +644,7 @@ class ClientSocketTest {
             body = """{"ok":true}"""
         ))
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         assertEquals("orange-111", cs.lastOperatorTrackingHeaders["X-Orange-Trace-Id"])
@@ -497,7 +658,7 @@ class ClientSocketTest {
             body = """{"ok":true}"""
         ))
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         assertFalse(cs.lastOperatorTrackingHeaders.containsKey("X-Custom-Header"))
@@ -507,7 +668,7 @@ class ClientSocketTest {
     fun `lastOperatorTrackingHeaders is empty when no tracking headers present`() {
         stubResponse(httpResponse(200, body = """{"ok":true}"""))
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         assertTrue(cs.lastOperatorTrackingHeaders.isEmpty())
@@ -520,7 +681,7 @@ class ClientSocketTest {
             body = """{"ok":true}"""
         ))
 
-        val cs = ClientSocket(mockTracer)
+        val cs = newClientSocket()
         cs.open(URL("https://api.example.com/"), emptyMap(), null, 5)
 
         // The key is stored as it appears in the response, value should be captured

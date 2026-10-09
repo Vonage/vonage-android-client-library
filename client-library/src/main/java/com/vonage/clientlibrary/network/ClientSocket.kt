@@ -1,16 +1,24 @@
 package com.vonage.clientlibrary.network
 
 import android.os.Build
+import android.os.Looper
 import android.util.Log
+import com.vonage.clientlibrary.VGCellularRequestClient
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.HttpCookie
+import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets
 import java.util.UUID
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 import org.json.JSONException
@@ -18,7 +26,10 @@ import org.json.JSONObject
 
 internal class ClientSocket constructor(
     var tracer: TraceCollector = TraceCollector.instance,
-    private val isDebuggable: Boolean = false
+    private val isDebuggable: Boolean = false,
+    // Test seam: lets unit tests avoid real DNS lookups. Production resolves the host normally.
+    private val resolveAddress: (host: String, port: Int) -> InetSocketAddress =
+        { host, port -> InetSocketAddress(host, port) }
 ) {
     private lateinit var socket: Socket
     private lateinit var output: OutputStream
@@ -33,7 +44,8 @@ internal class ClientSocket constructor(
         url: URL,
         headers: Map<String, String>?,
         operator: String?,
-        maxRedirectCount: Int
+        maxRedirectCount: Int,
+        handshakeTimeoutMs: Int = VGCellularRequestClient.DEFAULT_HANDSHAKE_TIMEOUT_MS
     ): JSONObject {
         val requestId: String = UUID.randomUUID().toString()
         val deadline = System.currentTimeMillis() + GLOBAL_DEADLINE_MS
@@ -67,7 +79,7 @@ internal class ClientSocket constructor(
                 val reusingConnection = (nurlAuthority == connectedAuthority) && connectionKeptAlive
                 if (!reusingConnection) {
                     if (connectedAuthority != null) stopConnection()
-                    startConnection(nurl, remainingMs)
+                    startConnection(nurl, remainingMs, handshakeTimeoutMs)
                     connectedAuthority = nurlAuthority
                 } else {
                     // Refresh soTimeout to reflect remaining deadline budget
@@ -117,6 +129,8 @@ internal class ClientSocket constructor(
                     connectedAuthority = null
                 }
                 connectionKeptAlive = false
+                if (ex is TlsHandshakeTimeoutException)
+                    return convertError("sdk_tls_handshake_timeout", ex.message ?: "TLS handshake timed out")
                 return convertError("sdk_connection_error", "ex: ".plus(ex.localizedMessage))
             }
         } while (redirectURL != null && redirectCount <= maxRedirectCount)
@@ -358,21 +372,57 @@ internal class ClientSocket constructor(
         return sendAndReceive(url, command, cookies)
     }
 
-    private fun startConnection(url: URL, timeoutMs: Long = 5_000) {
+    /**
+     * Opens a connection to [url].
+     *
+     * DNS resolution, the TCP connect and (for HTTPS) the TLS handshake share a single window of
+     * [handshakeTimeoutMs], capped by [timeoutMs] (the remaining overall request budget). If an
+     * HTTPS connection cannot be established in that window, [TlsHandshakeTimeoutException] is
+     * thrown. Reads after the handshake use [timeoutMs] as the socket read timeout.
+     */
+    private fun startConnection(
+        url: URL,
+        timeoutMs: Long = 5_000,
+        handshakeTimeoutMs: Int = VGCellularRequestClient.DEFAULT_HANDSHAKE_TIMEOUT_MS
+    ) {
         val port = if (url.port > 0) url.port else defaultPort(url.protocol)
+        val readTimeout = timeoutMs.coerceAtLeast(1L).toInt()
+        val setupTimeout = minOf(handshakeTimeoutMs.toLong(), timeoutMs).coerceAtLeast(1L).toInt()
+        val setupDeadline = System.currentTimeMillis() + setupTimeout
+
+        /** Milliseconds left in the setup window; throws a timeout once it is exhausted. */
+        fun setupRemaining(stage: String): Int {
+            val left = setupDeadline - System.currentTimeMillis()
+            if (left <= 0) throw SocketTimeoutException("No time left for $stage")
+            return left.toInt()
+        }
 
         httpLogger.logConnection("Opening", url.host, port)
 
         tracer.addDebug(Log.DEBUG, TAG, "start : ${url.host} ${url.port} ${url.protocol}")
         tracer.addTrace("\nStart connection ${url.host} ${url.port} ${url.protocol} ${DateUtils.now()}\n")
         val newSocket: Socket = if (url.protocol == "https") {
-            val sslSocket = SSLSocketFactory.getDefault().createSocket(url.host, port) as SSLSocket
+            // Create the socket unconnected so the TCP connect itself can be time-bounded;
+            // createSocket(host, port) connects in the call with no timeout.
+            val sslSocket = SSLSocketFactory.getDefault().createSocket() as SSLSocket
             try {
-                sslSocket.soTimeout = timeoutMs.coerceAtLeast(1L).toInt()
-                val params = sslSocket.sslParameters
-                params.endpointIdentificationAlgorithm = "HTTPS"
-                sslSocket.sslParameters = params
-                sslSocket.startHandshake()
+                try {
+                    val address = resolveWithin(url.host, port, setupRemaining("DNS lookup"))
+                    sslSocket.connect(address, setupRemaining("TCP connect"))
+                    sslSocket.soTimeout = setupRemaining("TLS handshake")
+                    val params = sslSocket.sslParameters
+                    params.endpointIdentificationAlgorithm = "HTTPS"
+                    sslSocket.sslParameters = params
+                    sslSocket.startHandshake()
+                } catch (ex: Exception) {
+                    if (!isTimeout(ex)) throw ex
+                    throw TlsHandshakeTimeoutException(
+                        "TLS handshake with ${url.host} did not complete within ${setupTimeout}ms " +
+                            "(${ex.message})",
+                        ex
+                    )
+                }
+                sslSocket.soTimeout = readTimeout
             } catch (ex: Exception) {
                 tracer.addDebug(Log.ERROR, TAG, "Cannot create socket exception : ${ex.message}")
                 tracer.addTrace("Cannot create socket exception ${ex.message}\n")
@@ -381,8 +431,15 @@ internal class ClientSocket constructor(
             }
             sslSocket
         } else {
-            val plainSocket = Socket(url.host, port)
-            plainSocket.soTimeout = timeoutMs.coerceAtLeast(1L).toInt()
+            val plainSocket = Socket()
+            try {
+                val address = resolveWithin(url.host, port, setupRemaining("DNS lookup"))
+                plainSocket.connect(address, setupRemaining("TCP connect"))
+                plainSocket.soTimeout = readTimeout
+            } catch (ex: Exception) {
+                runCatching { plainSocket.close() }
+                throw ex
+            }
             plainSocket
         }
         socket = newSocket
@@ -405,6 +462,31 @@ internal class ClientSocket constructor(
             tracer.addTrace("Client exception ${ex.message}\n")
             if (!socket.isClosed) socket.close()
             throw ex
+        }
+    }
+
+    /**
+     * Resolves [host] on a daemon thread and waits at most [timeoutMs] for the answer.
+     *
+     * The platform resolver (getaddrinfo) cannot be cancelled, and on a carrier network that
+     * silently drops DNS it can block far longer than the caller's budget. Bounding the wait here
+     * returns control to the caller on time; an abandoned lookup thread finishes on its own when
+     * the OS resolver gives up.
+     */
+    private fun resolveWithin(host: String, port: Int, timeoutMs: Int): InetSocketAddress {
+        // On the main thread, resolve inline: Android rejects network I/O there immediately
+        // (NetworkOnMainThreadException). Waiting on a helper thread would freeze the UI instead.
+        if (Looper.myLooper() == Looper.getMainLooper()) return resolveAddress(host, port)
+
+        val lookup = FutureTask { resolveAddress(host, port) }
+        Thread(lookup, "vonage-dns-lookup").apply { isDaemon = true }.start()
+        return try {
+            lookup.get(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+        } catch (ex: TimeoutException) {
+            lookup.cancel(true)
+            throw SocketTimeoutException("DNS lookup for $host timed out")
+        } catch (ex: ExecutionException) {
+            throw ex.cause ?: ex
         }
     }
 
@@ -684,6 +766,10 @@ internal class ClientSocket constructor(
 
         private fun defaultPort(protocol: String): Int =
             if (protocol == "https") PORT_443 else PORT_80
+
+        /** True if [ex] or anything in its cause chain is a socket timeout. */
+        private fun isTimeout(ex: Throwable): Boolean =
+            generateSequence(ex) { it.cause }.take(10).any { it is SocketTimeoutException }
         private val HTTP_STATUS_RANGE = 100..599
 
         // Operator-injected tracking headers to capture and log for troubleshooting.
