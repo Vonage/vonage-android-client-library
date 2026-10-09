@@ -1,0 +1,53 @@
+client-library/src/main/java/com/vonage/clientlibrary/network/NetworkManager.kt
+  s_af781291f79612::t_5382f52bfc8770 9-15
+client-library/src/test/java/com/vonage/clientlibrary/network/HandshakeTimeoutTest.kt
+  s_af781291f79612::t_11e3514d4f0cc9 1-60
+client-library/src/main/java/com/vonage/clientlibrary/VGCellularRequestClient.kt
+  s_af781291f79612::t_017cfa2caf4bd5 35-38,40-41,43-52,60
+  s_af781291f79612::t_2700909c05b0bd 39,59
+client-library/src/main/java/com/vonage/clientlibrary/network/TlsHandshakeTimeoutException.kt
+  s_af781291f79612::t_66e69909dfe6e1 1-5,7-11
+  s_af781291f79612::t_0bfc1ec516019a 6
+client-library/src/test/java/com/vonage/clientlibrary/VGCellularRequestClientTest.kt
+  s_af781291f79612::t_b56a58323abbbe 103,105,108-156
+  s_af781291f79612::t_ce186a242fed1b 94-102,104,106-107,157-158
+client-library/src/main/java/com/vonage/clientlibrary/network/CellularNetworkManager.kt
+  s_af781291f79612::t_2c5eda62fd986d 61-67
+client-library/src/test/java/com/vonage/clientlibrary/network/ClientSocketTest.kt
+  s_af781291f79612::t_b412f1b750c818 525,534-546,548-570,575-577,595-607
+  s_af781291f79612::t_5a7e8f5cdcf4a9 571-574,578-594
+  s_af781291f79612::t_bd32ca5c241bcd 55-58
+  s_af781291f79612::t_f909c0391074c8 59-70
+  s_af781291f79612::t_ce75ea677b02a6 73,121,131,134,143,149,171,177,196,200,222,228,246,252,279,284,300,324,328,331,346,350,354,359,372,385,404,410,431,437,458
+  s_af781291f79612::t_d14e59c15bcb82 471-524,526-533,608-609
+  s_af781291f79612::t_47bdf34eb0f420 547
+client-library/src/main/java/com/vonage/clientlibrary/network/ClientSocket.kt
+  s_af781291f79612::t_8ac966f5dfea5e 477-480
+  s_af781291f79612::t_702aaf99977959 406
+  s_af781291f79612::t_7bbf5394622e57 48,386
+  s_af781291f79612::t_0cc4249ba6b3f4 11,13,29-32
+  s_af781291f79612::t_13ed9d469336a0 132-133
+  s_af781291f79612::t_f8c8ef91315fcc 468-476,481-492
+  s_af781291f79612::t_e4e21895710dab 378,391-398,410-412,420-421,436-437
+  s_af781291f79612::t_48a695da3727a6 375-377,379-385,387,389-390,405,407,409,413-419,422-425,434-435,438-442
+  s_af781291f79612::t_aa0571da6604e9 18-21
+  s_af781291f79612::t_cf8f202825b33a 47
+client-library/src/test/java/com/vonage/clientlibrary/network/LoggingSuppressionTest.kt
+  s_af781291f79612::t_b7087a6d484317 79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ec8236d6ca6d5fb2125b07fdc12125a381ea9685",
+  "prompts": {},
+  "sessions": {
+    "s_af781291f79612": {
+      "agent_id": {
+        "tool": "kiro",
+        "id": "sess_d610d080-9a45-4771-a50c-2d0f5ac7679d",
+        "model": "auto"
+      },
+      "human_author": "Chris Tankersley <chris@ctankersley.com>"
+    }
+  }
+}
