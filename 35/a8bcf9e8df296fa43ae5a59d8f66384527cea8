@@ -1,0 +1,23 @@
+README.md
+  s_af781291f79612::t_ce5647f8572385 19-22
+  s_af781291f79612::t_5c6cbadb42a490 84-89
+  s_af781291f79612::t_5dfa9f9d90097a 23
+client-library/build.gradle.kts
+  s_af781291f79612::t_82f29b1f75277f 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "35a8bcf9e8df296fa43ae5a59d8f66384527cea8",
+  "prompts": {},
+  "sessions": {
+    "s_af781291f79612": {
+      "agent_id": {
+        "tool": "kiro",
+        "id": "sess_d610d080-9a45-4771-a50c-2d0f5ac7679d",
+        "model": "auto"
+      },
+      "human_author": "Chris Tankersley <chris@ctankersley.com>"
+    }
+  }
+}
