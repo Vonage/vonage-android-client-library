@@ -16,6 +16,11 @@ implementation 'com.vonage:client-library:1.3.2'
 
 > **Silent Auth Advanced** is available as of `1.3.0`. Its API is still experimental and may change in a future release.
 
+> **Configurable handshake timeout** (`handshakeTimeoutMs`, see [Force a Cellular Network Request](#force-a-cellular-network-request)) is available in the `1.4.0-alpha01` pre-release:
+> ```
+> implementation 'com.vonage:client-library:1.4.0-alpha01'
+> ```
+
 ## Usage
 
 ### Check Cellular Connectivity
@@ -76,6 +81,12 @@ if (response.has("error")) {
 
 * `maxRedirectCount` in `VGCellularRequestParameters` is optional and defaults to 10.
 * `debug` parameter for `startCellularGetRequest` is optional and defaults to false.
+* `startCellularGetRequest` accepts an optional third argument, `handshakeTimeoutMs` *(`1.4.0-alpha01`+)*: the time allowed, per connection, to resolve the host (DNS), open the connection and complete the TLS handshake. It defaults to 5000 ms (`VGCellularRequestClient.DEFAULT_HANDSHAKE_TIMEOUT_MS`) and must be between 1000 and 10000 ms, otherwise an `IllegalArgumentException` is thrown. If the handshake does not complete in time, the response contains `"error": "sdk_tls_handshake_timeout"`. Existing calls without the argument are unaffected.
+
+  ```kotlin
+  val response = VGCellularRequestClient.getInstance().startCellularGetRequest(params, false, 8_000)
+  ```
+* `startCellularGetRequest` is blocking. Call it from a background thread, not the main thread.
 * Only `https://` URLs are accepted. Passing an `http://` URL will throw a `MalformedURLException`.
 
 #### Responses
@@ -115,7 +126,7 @@ if (response.has("error")) {
 
 `operator_tracking` is only present in the `debug` block when `debug = true` and the operator returned tracking headers in the response. Currently captured headers: `X-Orange-Trace-Id` (Orange), `X-VIG-Trace-Id` (Vodafone).
 
-Potential error codes: `sdk_no_data_connectivity`, `sdk_connection_error`, `sdk_redirect_error`, `sdk_error`.
+Potential error codes: `sdk_no_data_connectivity`, `sdk_connection_error`, `sdk_tls_handshake_timeout`, `sdk_timeout_error`, `sdk_redirect_error`, `sdk_error`.
 
 ### Silent Auth Advanced (SAA) *(alpha)*
 

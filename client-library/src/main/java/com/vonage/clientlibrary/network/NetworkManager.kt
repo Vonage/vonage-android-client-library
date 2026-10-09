@@ -6,6 +6,12 @@ import java.net.URL
 
 internal interface NetworkManager {
     fun getCellularStatus(): CellularStatus
-    fun openWithDataCellular(url: URL, headers: Map<String, String>?, maxRedirectCount: Int, debug: Boolean): JSONObject
+    fun openWithDataCellular(
+        url: URL,
+        headers: Map<String, String>?,
+        maxRedirectCount: Int,
+        debug: Boolean,
+        handshakeTimeoutMs: Int
+    ): JSONObject
     fun postWithDataCellular(url: URL, headers: Map<String, String>, body: String?): JSONObject
 }

@@ -91,6 +91,71 @@ class VGCellularRequestClientTest {
         }
     }
 
+    @Test
+    fun `startCellularGetRequest passes handshakeTimeoutMs to the network manager`() {
+        val client = buildClient()
+        val mockNm = mockk<NetworkManager>(relaxed = true)
+        injectMockNetworkManager(client, mockNm)
+
+        val params = VGCellularRequestParameters(
+            url = "https://api.example.com/test",
+            headers = emptyMap(),
+            queryParameters = emptyMap()
+        )
+        client.startCellularGetRequest(params, false, 3_000)
+
+        verify(exactly = 1) { mockNm.openWithDataCellular(any(), any(), 10, false, 3_000) }
+    }
+
+    @Test
+    fun `startCellularGetRequest without a timeout uses the 5s default`() {
+        val client = buildClient()
+        val mockNm = mockk<NetworkManager>(relaxed = true)
+        injectMockNetworkManager(client, mockNm)
+
+        val params = VGCellularRequestParameters("https://api.example.com/test", emptyMap(), emptyMap())
+        client.startCellularGetRequest(params, false)
+
+        verify(exactly = 1) { mockNm.openWithDataCellular(any(), any(), 10, false, 5_000) }
+    }
+
+    @Test
+    fun `startCellularGetRequest accepts the 1s and 10s bounds`() {
+        val client = buildClient()
+        val mockNm = mockk<NetworkManager>(relaxed = true)
+        injectMockNetworkManager(client, mockNm)
+        val params = VGCellularRequestParameters("https://api.example.com/test", emptyMap(), emptyMap())
+
+        client.startCellularGetRequest(params, false, 1_000)
+        client.startCellularGetRequest(params, false, 10_000)
+
+        verify(exactly = 1) { mockNm.openWithDataCellular(any(), any(), any(), any(), 1_000) }
+        verify(exactly = 1) { mockNm.openWithDataCellular(any(), any(), any(), any(), 10_000) }
+    }
+
+    @Test
+    fun `startCellularGetRequest rejects a timeout outside 1-10s without making a request`() {
+        val client = buildClient()
+        val mockNm = mockk<NetworkManager>(relaxed = true)
+        injectMockNetworkManager(client, mockNm)
+        val params = VGCellularRequestParameters("https://api.example.com/test", emptyMap(), emptyMap())
+
+        assertThrows(IllegalArgumentException::class.java) { client.startCellularGetRequest(params, false, 999) }
+        assertThrows(IllegalArgumentException::class.java) { client.startCellularGetRequest(params, false, 10_001) }
+        verify(exactly = 0) { mockNm.openWithDataCellular(any(), any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `original two-argument startCellularGetRequest signature is preserved for compiled callers`() {
+        // Apps and libraries compiled against <= 1.3.x link to this exact JVM signature.
+        val method = VGCellularRequestClient::class.java.getMethod(
+            "startCellularGetRequest",
+            VGCellularRequestParameters::class.java,
+            Boolean::class.javaPrimitiveType
+        )
+        assertEquals(org.json.JSONObject::class.java, method.returnType)
+    }
+
     // ------------------------------------------------------------------
     // DEVX-11183: getCellularStatus()
     // ------------------------------------------------------------------

@@ -32,15 +32,32 @@ class VGCellularRequestClient private constructor(networkManager: CellularNetwor
     - Parameters:
       - params: Parameters to configure your GET request
       - debug: A flag to include or not the url trace in the response
+      - handshakeTimeoutMs: Optional. Time allowed, per connection, to resolve the host (DNS), open
+        the TCP connection and complete the TLS handshake. Defaults to
+        DEFAULT_HANDSHAKE_TIMEOUT_MS (5s); must be between MIN_HANDSHAKE_TIMEOUT_MS (1s) and
+        MAX_HANDSHAKE_TIMEOUT_MS (10s), otherwise IllegalArgumentException is thrown.
+    - Returns a JSONObject. On failure it contains "error" and "error_description"; an error of
+      "sdk_tls_handshake_timeout" means a secure connection could not be established within
+      handshakeTimeoutMs.
     */
-    fun startCellularGetRequest(params: VGCellularRequestParameters, debug: Boolean): JSONObject {
+    @JvmOverloads
+    fun startCellularGetRequest(
+        params: VGCellularRequestParameters,
+        debug: Boolean,
+        handshakeTimeoutMs: Int = DEFAULT_HANDSHAKE_TIMEOUT_MS
+    ): JSONObject {
+        require(handshakeTimeoutMs in MIN_HANDSHAKE_TIMEOUT_MS..MAX_HANDSHAKE_TIMEOUT_MS) {
+            "handshakeTimeoutMs must be between $MIN_HANDSHAKE_TIMEOUT_MS and " +
+                "$MAX_HANDSHAKE_TIMEOUT_MS, was $handshakeTimeoutMs"
+        }
         val uri = constructURL(params)
         val networkManager: NetworkManager = getCellularNetworkManager()
         return networkManager.openWithDataCellular(
             uri,
             params.headers,
             params.maxRedirectCount,
-            debug
+            debug,
+            handshakeTimeoutMs
         )
     }
 
@@ -90,6 +107,11 @@ class VGCellularRequestClient private constructor(networkManager: CellularNetwor
     }
 
     companion object {
+        /** Default for the `handshakeTimeoutMs` argument of [startCellularGetRequest]. */
+        const val DEFAULT_HANDSHAKE_TIMEOUT_MS: Int = 5_000
+        const val MIN_HANDSHAKE_TIMEOUT_MS: Int = 1_000
+        const val MAX_HANDSHAKE_TIMEOUT_MS: Int = 10_000
+
         private var instance: VGCellularRequestClient? = null
         private var currentContext: Context? = null
 

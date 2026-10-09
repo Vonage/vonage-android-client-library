@@ -15,6 +15,7 @@ import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowLog
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.net.InetSocketAddress
 import java.net.URL
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
@@ -75,7 +76,7 @@ class LoggingSuppressionTest {
             "Content-Length: 11\r\n\r\n" +
             """{"ok":true}"""
         ).toByteArray(Charsets.UTF_8)
-        every { mockSSLSocketFactory.createSocket(any<String>(), any<Int>()) } returnsMany
+        every { mockSSLSocketFactory.createSocket() } returnsMany
             listOf(makeMockSocket(redirect), makeMockSocket(ok))
     }
 
@@ -91,7 +92,7 @@ class LoggingSuppressionTest {
         TraceCollector.instance.shouldLogDebugInfoToConsole(false)
         stubRedirectThen200()
 
-        ClientSocket().open(URL("https://api.example.com/verify"), emptyMap(), null, 5)
+        ClientSocket(resolveAddress = InetSocketAddress::createUnresolved).open(URL("https://api.example.com/verify"), emptyMap(), null, 5)
 
         val leaked = cellularClientLogs()
         assertEquals("Release build must not emit any CellularClient logs, but did: $leaked", 0, leaked.size)
@@ -102,7 +103,7 @@ class LoggingSuppressionTest {
         TraceCollector.instance.shouldLogDebugInfoToConsole(true)
         stubRedirectThen200()
 
-        ClientSocket().open(URL("https://api.example.com/verify"), emptyMap(), null, 5)
+        ClientSocket(resolveAddress = InetSocketAddress::createUnresolved).open(URL("https://api.example.com/verify"), emptyMap(), null, 5)
 
         assertTrue(
             "Debuggable build should emit CellularClient logs, but none were captured",
